@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autonomous Video Studio</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body class="studio-dark">
+  <!-- Top Navigation Bar -->
+  <header class="studio-header">
+    <div class="header-left">
+      <div class="brand">
+        <span class="brand-icon">🎬</span>
+        <span class="brand-title">Autonomous Video Studio</span>
+        <span class="version-tag">Pipeline v1.0</span>
+      </div>
+      <!-- Tool Health Readiness Badges -->
+      <div class="tool-readiness" id="tool-readiness">
+        <div class="tool-pill" data-tool="agy" title="Antigravity (AGY)"><span class="tool-dot"></span>AGY</div>
+        <div class="tool-pill" data-tool="hyperframes" title="HyperFrames"><span class="tool-dot"></span>HyperFrames</div>
+        <div class="tool-pill" data-tool="ffmpeg" title="FFmpeg"><span class="tool-dot"></span>FFmpeg</div>
+        <div class="tool-pill" data-tool="ffprobe" title="FFprobe"><span class="tool-dot"></span>FFprobe</div>
+        <div class="tool-pill" data-tool="uv" title="uv Python Manager"><span class="tool-dot"></span>uv</div>
+        <div class="tool-pill" data-tool="comfy" title="ComfyUI Local"><span class="tool-dot"></span>ComfyUI</div>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="job-switcher-container">
+        <label for="job-history-select" class="sr-only">Job History</label>
+        <select id="job-history-select" class="studio-select">
+          <option value="new">+ New Video Run</option>
+        </select>
+      </div>
+      <button id="btn-nav-new" class="btn btn-secondary">
+        <span>+</span> New Run
+      </button>
+      <button id="btn-refresh-health" class="btn btn-ghost" title="Refresh Health Check">
+        🔄
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Workspace -->
+  <main class="studio-main">
+    
+    <!-- ================================================================= -->
+    <!-- VIEW 1: NEW RUN CREATOR                                           -->
+    <!-- ================================================================= -->
+    <section id="view-new-run" class="view-panel active">
+      <div class="container-split">
+        
+        <!-- Left Column: Source Media & Clips -->
+        <div class="panel-column left-col">
+          <div class="section-card">
+            <div class="card-header">
+              <h2>1. Select Source Footage</h2>
+              <span class="badge" id="selected-clips-badge">0 clips selected</span>
+            </div>
+
+            <!-- Quick Root Directory Switcher -->
+            <div class="quick-roots-bar">
+              <span class="label-tiny">Quick Roots:</span>
+              <div id="quick-root-buttons" class="root-buttons-list">
+                <button type="button" class="btn-chip active" data-path="/home/sandbox/ContentCreation/raw_clips">raw_clips/</button>
+                <button type="button" class="btn-chip" data-path="/mnt/01/pixel9a/Camera">pixel9a/Camera</button>
+              </div>
+            </div>
+
+            <!-- Custom Folder Path Input -->
+            <div class="folder-input-row">
+              <input type="text" id="input-folder-path" class="studio-input" placeholder="/path/to/clips" value="/home/sandbox/ContentCreation/raw_clips">
+              <button id="btn-load-folder" class="btn btn-secondary">Load Clips</button>
+            </div>
+
+            <!-- Drag & Drop Upload Zone -->
+            <div id="dropzone" class="dropzone-area">
+              <input type="file" id="file-upload-input" multiple accept="video/mp4,video/quicktime,video/webm,video/x-matroska" class="file-input-hidden">
+              <div class="dropzone-inner">
+                <span class="drop-icon">📤</span>
+                <p class="drop-text">Drag & drop video clips here, or <button type="button" id="btn-browse-files" class="btn-link">browse</button></p>
+                <span class="drop-hint">MP4, MOV, WebM, MKV up to 4K</span>
+              </div>
+              <div id="upload-progress-container" class="upload-progress-container hidden">
+                <div class="progress-bar-bg">
+                  <div id="upload-progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+                </div>
+                <span id="upload-progress-text" class="progress-label">Uploading...</span>
+              </div>
+            </div>
+
+            <!-- Clips Browser & Reorder Shelf -->
+            <div class="clips-shelf-header">
+              <span class="shelf-title">Available in Folder</span>
+              <div class="shelf-actions">
+                <button id="btn-select-all" class="btn-link-subtle">Select All</button>
+                <span class="divider">|</span>
+                <button id="btn-deselect-all" class="btn-link-subtle">Deselect All</button>
+              </div>
+            </div>
+
+            <div id="clips-grid" class="clips-grid">
+              <div class="empty-state">Loading clips from folder...</div>
+            </div>
+
+            <!-- Selected Order Sequence Drawer -->
+            <div class="selected-sequence-shelf" id="selected-sequence-shelf">
+              <div class="sequence-title">
+                <span>Selected Story Sequence:</span>
+                <span id="total-selection-duration" class="text-muted">Total: 0s</span>
+              </div>
+              <div id="sequence-list" class="sequence-list">
+                <span class="text-muted text-sm">No clips selected yet. Click clips above to sequence.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Column: Preset, Angle & Build Config -->
+        <div class="panel-column right-col">
+          <div class="section-card">
+            <div class="card-header">
+              <h2>2. Video Architecture & Preset</h2>
+            </div>
+
+            <!-- Preset Cards Grid -->
+            <div class="presets-grid" id="presets-container">
+              <!-- Preset Cards populated by app.js -->
+              <div class="preset-card active" data-preset="story_vertical">
+                <div class="preset-radio"><span class="radio-dot"></span></div>
+                <div class="preset-content">
+                  <div class="preset-name">Story-First Vertical (1080x1920)</div>
+                  <div class="preset-desc">9:16 vertical hook-first format. Maximum dynamic pacing, kinetic captions, and emotional turn.</div>
+                  <div class="preset-meta">
+                    <span class="tag">9:16</span>
+                    <span class="tag">TikTok / Reels / Shorts</span>
+                    <span class="tag">~45s</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="preset-card" data-preset="retention_3step">
+                <div class="preset-radio"><span class="radio-dot"></span></div>
+                <div class="preset-content">
+                  <div class="preset-name">3-Step Retention (1080x1920)</div>
+                  <div class="preset-desc">3-step actionable breakdown designed for algorithmic retention, rapid curiosity loops, and zero fluff.</div>
+                  <div class="preset-meta">
+                    <span class="tag">9:16</span>
+                    <span class="tag">High Pacing</span>
+                    <span class="tag">~45s</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="preset-card" data-preset="landscape_explainer">
+                <div class="preset-radio"><span class="radio-dot"></span></div>
+                <div class="preset-content">
+                  <div class="preset-name">Landscape Explainer (1920x1080)</div>
+                  <div class="preset-desc">16:9 widescreen format for deep-dive case studies, forensic breakdowns, and software canvas workflows.</div>
+                  <div class="preset-meta">
+                    <span class="tag">16:9</span>
+                    <span class="tag">YouTube</span>
+                    <span class="tag">~60s</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Story Angle / Prompt Input -->
+            <div class="form-group">
+              <label for="input-story-prompt" class="form-label">
+                Story Angle or Guiding Claim <span class="text-muted">(Optional)</span>
+              </label>
+              <textarea id="input-story-prompt" class="studio-textarea" rows="3" placeholder="Optional angle or topic — leave blank to discover the strongest story automatically from raw spoken speech..."></textarea>
+              <span class="form-help">Guides the Opus scriptwriter on claim, stakes, and narrative payoff.</span>
+            </div>
+
+            <!-- Pipeline Governance Toggles -->
+            <div class="governance-section">
+              <div class="section-subtitle">Pipeline Quality Gates & Options</div>
+
+              <!-- Gate A Toggle -->
+              <label class="toggle-control">
+                <input type="checkbox" id="toggle-gate-a">
+                <span class="toggle-slider"></span>
+                <span class="toggle-label-group">
+                  <span class="toggle-title">Pause to approve Script before building (Gate A)</span>
+                  <span class="toggle-desc">Review 3 Opus concept drafts with critic scores, edit quotes or approve draft before base cut build.</span>
+                </span>
+              </label>
+
+              <!-- Gate B Toggle -->
+              <label class="toggle-control">
+                <input type="checkbox" id="toggle-gate-b">
+                <span class="toggle-slider"></span>
+                <span class="toggle-label-group">
+                  <span class="toggle-title">Pause to listen to Base Audio Cut before graphics (Gate B)</span>
+                  <span class="toggle-desc">3-minute listen pass on raw speech joins, choose candidate BGM tracks before spending on graphics.</span>
+                </span>
+              </label>
+
+              <div class="options-row">
+                <!-- Whisper Model -->
+                <div class="form-subgroup">
+                  <label class="form-label text-xs">Whisper Accuracy</label>
+                  <div class="segmented-control" id="whisper-control">
+                    <button type="button" class="segment-btn active" data-val="fast">Fast (small.en)</button>
+                    <button type="button" class="segment-btn" data-val="high">High (medium.en)</button>
+                  </div>
+                </div>
+
+                <!-- AI B-Roll -->
+                <div class="form-subgroup">
+                  <label class="form-label text-xs">AI B-Roll Insertion</label>
+                  <select id="select-ai-broll" class="studio-select text-xs">
+                    <option value="off">Off (Raw cuts only)</option>
+                    <option value="comfyui">ComfyUI Local</option>
+                    <option value="mcp">HeyGen / ElevenLabs MCP</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <!-- AI Model Routing (AGY) -->
+            <div class="model-routing-section">
+              <div class="section-subtitle-row">
+                <span class="section-subtitle">AI Model Routing (AGY)</span>
+                <span class="badge-subtle">Per-Stage Intelligence</span>
+              </div>
+
+              <!-- Creative Model -->
+              <div class="form-group mb-3">
+                <div class="model-label-row">
+                  <label for="select-creative-model" class="form-label text-xs">
+                    Creative Model (Script & Graphics)
+                  </label>
+                  <span id="badge-creative-quota" class="quota-pill hidden">⚠️ High Quota</span>
+                </div>
+                <select id="select-creative-model" class="studio-select text-xs model-select">
+                  <option value="gemini-3.8-flash-high">Gemini 3.8 Flash High (Fast / Unlimited)</option>
+                </select>
+                <span class="form-help text-xs" id="help-creative-model">Fast, zero-rate-limit generation for concept drafts, critic scoring, and motion design.</span>
+              </div>
+
+              <!-- Mechanical & QA Model -->
+              <div class="form-group mb-2">
+                <div class="model-label-row">
+                  <label for="select-mechanical-model" class="form-label text-xs">
+                    Mechanical & QA Model (EDL, Vision, Covers, Copy)
+                  </label>
+                  <span id="badge-mechanical-quota" class="quota-pill hidden">⚠️ High Quota</span>
+                </div>
+                <select id="select-mechanical-model" class="studio-select text-xs model-select">
+                  <option value="gemini-3.8-flash-high">Gemini 3.8 Flash High (Fast / Unlimited)</option>
+                </select>
+                <span class="form-help text-xs" id="help-mechanical-model">Precision timing snap, subtitle verification, and platform copy.</span>
+              </div>
+            </div>
+
+            <!-- Primary Generate CTA Button -->
+            <div class="cta-row">
+              <button id="btn-generate-video" class="btn btn-primary btn-large" disabled>
+                <span class="btn-icon">⚡</span>
+                <span class="btn-text">Generate Video (0 clips selected)</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ================================================================= -->
+    <!-- VIEW 2: JOB MONITOR & DELIVERY DECK                               -->
+    <!-- ================================================================= -->
+    <section id="view-job-monitor" class="view-panel">
+      
+      <!-- Top Job Status Summary Bar -->
+      <div class="job-monitor-header">
+        <div class="monitor-left">
+          <div class="job-id-tag" id="mon-job-id">job_loading...</div>
+          <div class="status-pill status-running" id="mon-job-status">Running</div>
+          <div class="preset-tag" id="mon-job-preset">Story-First Vertical</div>
+        </div>
+
+        <!-- Compact Mid-Job AI Models Routing -->
+        <div class="monitor-models-control" id="mon-models-control">
+          <span class="models-ctrl-label" title="Live Model Routing: changes take effect before Retry Stage">🤖 Models:</span>
+          <div class="model-select-compact-wrap" title="Creative Model for Script & Graphics">
+            <span class="model-type-tag">Creative:</span>
+            <select id="mon-select-creative-model" class="studio-select text-xs model-select-compact">
+              <option value="gemini-3.8-flash-high">Gemini 3.8 Flash High</option>
+            </select>
+            <span id="mon-badge-creative-quota" class="quota-dot hidden" title="Uses Quota Quickly"></span>
+          </div>
+          <div class="model-select-compact-wrap" title="Mechanical Model for EDL & QA">
+            <span class="model-type-tag">Mechanical:</span>
+            <select id="mon-select-mechanical-model" class="studio-select text-xs model-select-compact">
+              <option value="gemini-3.8-flash-high">Gemini 3.8 Flash High</option>
+            </select>
+            <span id="mon-badge-mechanical-quota" class="quota-dot hidden" title="Uses Quota Quickly"></span>
+          </div>
+        </div>
+
+        <div class="monitor-right">
+          <div class="timer-badge">
+            <span class="timer-icon">⏱️</span>
+            <span id="mon-elapsed-time">00:00</span>
+          </div>
+          <button id="btn-cancel-job" class="btn btn-danger-outline btn-sm">Cancel Job</button>
+          <div class="retry-dropdown-wrap">
+            <select id="select-retry-stage" class="studio-select text-xs">
+              <option value="ingest">Retry: Ingest</option>
+              <option value="transcribe">Retry: Transcribe</option>
+              <option value="script">Retry: Script</option>
+              <option value="audio">Retry: Audio Cut</option>
+              <option value="graphics">Retry: Graphics</option>
+              <option value="render">Retry: Render</option>
+              <option value="qa">Retry: QA Check</option>
+            </select>
+            <button id="btn-retry-stage" class="btn btn-secondary btn-sm">Retry</button>
+          </div>
+          <button id="btn-toggle-copilot-header" class="btn btn-secondary btn-sm btn-copilot-toggle" title="Toggle Co-Pilot Panel">
+            <span>🤖 Co-Pilot</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Main Two-Column Workspace Layout (Left: Job Workspace, Right: Antigravity Co-Pilot) -->
+      <div class="job-workspace-split" id="job-workspace-split">
+        <!-- Left/Main Workspace (~62% width) -->
+        <div class="job-main-workspace" id="job-main-workspace">
+
+          <!-- 8-Stage Progress Rail -->
+          <div class="stage-rail-wrapper">
+            <div class="stage-rail" id="stage-rail">
+              <!-- Populated by app.js: ingest -> transcribe -> script -> audio -> graphics -> render -> qa -> deliverables -->
+            </div>
+          </div>
+
+          <!-- Main Inspection Area -->
+          <div class="job-content-container">
+
+        <!-- Gate A: Script Approval Panel -->
+        <div id="panel-gate-a" class="gate-panel hidden">
+          <div class="gate-banner">
+            <span class="gate-icon">⏸️</span>
+            <div class="gate-info">
+              <h3>Gate A: Script Approval Required</h3>
+              <p>The story engine drafted candidate concept cuts. Select a script draft, edit if desired, and approve to build the base audio cut.</p>
+            </div>
+          </div>
+
+          <div class="gate-options-grid" id="gate-a-options">
+            <!-- Populated dynamically with Draft A, B, C -->
+          </div>
+
+          <div class="gate-editor-box">
+            <div class="editor-header">
+              <label for="gate-a-script-editor" class="editor-title">Edit Approved Script Text Before Cut:</label>
+              <span class="text-muted text-xs">Spoken text will be snapped to silence and word boundaries</span>
+            </div>
+            <textarea id="gate-a-script-editor" class="studio-textarea script-editor" rows="6"></textarea>
+            <div class="editor-actions">
+              <button id="btn-approve-gate-a" class="btn btn-primary">
+                <span>✓</span> Approve & Build Base Cut
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Gate B: Audio & Base Cut Approval Panel -->
+        <div id="panel-gate-b" class="gate-panel hidden">
+          <div class="gate-banner">
+            <span class="gate-icon">🎧</span>
+            <div class="gate-info">
+              <h3>Gate B: Base Audio & Cut Approval</h3>
+              <p>Listen to the assembled voice track before spending tokens on graphics. Check join smoothness and pick your preferred background music.</p>
+            </div>
+          </div>
+
+          <div class="gate-b-content-split">
+            <!-- Left: Video Player for Base Cut -->
+            <div class="gate-b-player-card">
+              <div class="card-title-sm">Base Cut Audio & Video Alignment</div>
+              <div class="video-preview-wrapper aspect-vertical" id="base-video-container">
+                <video id="base-video-player" controls preload="metadata" class="studio-video-player"></video>
+              </div>
+            </div>
+
+            <!-- Right: QA Stats & BGM Selector -->
+            <div class="gate-b-controls-card">
+              <div class="card-title-sm">Base Audio QA Metrics</div>
+              <div class="qa-grid-mini" id="base-qa-metrics">
+                <div class="qa-metric"><span class="m-val" id="metric-base-dur">--</span><span class="m-lbl">Duration</span></div>
+                <div class="qa-metric"><span class="m-val" id="metric-base-cuts">--</span><span class="m-lbl">Splice Joins</span></div>
+                <div class="qa-metric"><span class="m-val" id="metric-base-stutters">--</span><span class="m-lbl">Pauses Snapped</span></div>
+                <div class="qa-metric"><span class="m-val" id="metric-base-lufs">--</span><span class="m-lbl">Voice LUFS</span></div>
+              </div>
+
+              <div class="bgm-selector-section">
+                <div class="card-title-sm">Select Candidate Background Music</div>
+                <div id="bgm-candidates-list" class="bgm-list">
+                  <div class="text-muted text-xs">Scanning candidate tracks...</div>
+                </div>
+              </div>
+
+              <div class="gate-actions-row">
+                <button id="btn-approve-gate-b" class="btn btn-primary btn-large">
+                  <span>✓</span> Approve & Generate Graphics
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Delivery Deck (Shown when Final.mp4 is ready) -->
+        <div id="panel-delivery-deck" class="delivery-deck hidden">
+          <div class="delivery-hero">
+            
+            <!-- Left: Final Video Player -->
+            <div class="delivery-player-box">
+              <div class="delivery-player-frame aspect-vertical" id="final-video-container">
+                <video id="final-video-player" controls preload="metadata" class="studio-video-player"></video>
+              </div>
+              <div class="player-toolbar">
+                <a id="btn-download-final" href="#" download="final.mp4" class="btn btn-primary">
+                  <span>⬇️</span> Download Final MP4
+                </a>
+              </div>
+            </div>
+
+            <!-- Right: Delivery Assets, QA Scorecard & HyperFrames Studio Bridge -->
+            <div class="delivery-details-box">
+              
+              <!-- QA Scorecard Badges -->
+              <div class="qa-scorecard-card">
+                <div class="card-title-sm">Algorithmic QA Scorecard</div>
+                <div class="qa-badges-row">
+                  <div class="score-badge"><span class="score-num" id="qa-script-match">99%</span><span class="score-desc">Script Match</span></div>
+                  <div class="score-badge"><span class="score-num" id="qa-duration">44.8s</span><span class="score-desc">Final Length</span></div>
+                  <div class="score-badge"><span class="score-num" id="qa-lufs">-14.0</span><span class="score-desc">Integrated LUFS</span></div>
+                  <div class="score-badge"><span class="score-num" id="qa-cuts">12</span><span class="score-desc">Dynamic Cuts</span></div>
+                </div>
+              </div>
+
+              <!-- HyperFrames Studio Bridge -->
+              <div class="hyperframes-bridge-card">
+                <div class="bridge-header">
+                  <div class="bridge-title-group">
+                    <span class="hf-icon">⚡</span>
+                    <div>
+                      <div class="bridge-title">HyperFrames Manual Refinement Studio</div>
+                      <div class="bridge-sub">Inspect or fine-tune motion graphics layers in live browser studio</div>
+                    </div>
+                  </div>
+                  <span id="studio-status-pill" class="studio-pill inactive">Studio Inactive</span>
+                </div>
+                <div class="bridge-actions">
+                  <button id="btn-open-studio" class="btn btn-secondary">
+                    <span>🚀</span> Open in HyperFrames Studio
+                  </button>
+                  <button id="btn-recomposite" class="btn btn-secondary">
+                    <span>🔄</span> Re-render Overlay & Re-composite
+                  </button>
+                  <button id="btn-stop-studio" class="btn btn-ghost btn-sm hidden">
+                    Stop Studio
+                  </button>
+                </div>
+              </div>
+
+              <!-- Covers A & B Section -->
+              <div class="covers-card">
+                <div class="card-title-sm">Distribution Covers (A/B Test)</div>
+                <div class="covers-row" id="covers-container">
+                  <div class="cover-box">
+                    <div class="cover-label">Cover A (Punch Angle)</div>
+                    <img id="img-cover-a" src="" alt="Cover A" class="cover-img">
+                    <a id="link-cover-a" href="#" download="cover_a.jpg" class="btn-link-subtle">Download JPG</a>
+                  </div>
+                  <div class="cover-box">
+                    <div class="cover-label">Cover B (Curiosity Angle)</div>
+                    <img id="img-cover-b" src="" alt="Cover B" class="cover-img">
+                    <a id="link-cover-b" href="#" download="cover_b.jpg" class="btn-link-subtle">Download JPG</a>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 5 Descriptions Section -->
+              <div class="descriptions-card">
+                <div class="card-title-sm">5 Optimized Platform Descriptions</div>
+                <div class="desc-tabs" id="desc-tabs">
+                  <button class="desc-tab active" data-desc-type="hook">Hook</button>
+                  <button class="desc-tab" data-desc-type="teaser">Teaser</button>
+                  <button class="desc-tab" data-desc-type="confessional">Confessional</button>
+                  <button class="desc-tab" data-desc-type="debate">Debate</button>
+                  <button class="desc-tab" data-desc-type="minimal">Minimal</button>
+                </div>
+                <div class="desc-content-box">
+                  <p id="desc-text-body" class="desc-text">Select a description tab above to view copy.</p>
+                  <div class="desc-copy-row">
+                    <span id="desc-rec-badge" class="rec-badge hidden">★ Recommended for Reels/Shorts</span>
+                    <button id="btn-copy-desc" class="btn btn-secondary btn-sm">
+                      <span class="copy-icon">📋</span> Copy Description
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+
+        <!-- Monospace Real-Time SSE Log Stream Console -->
+        <div class="console-card" id="console-card">
+          <div class="console-header">
+            <div class="console-title-group">
+              <span class="console-dot"></span>
+              <span class="console-title">Live Pipeline Log Console</span>
+              <span class="console-counter" id="log-count">0 events</span>
+            </div>
+            <div class="console-controls">
+              <label class="control-toggle-sm">
+                <input type="checkbox" id="toggle-autoscroll" checked>
+                <span>Auto-scroll</span>
+              </label>
+              <button id="btn-clear-console" class="btn-link-subtle">Clear</button>
+              <button id="btn-toggle-console" class="btn-link-subtle">Minimize</button>
+            </div>
+          </div>
+          <div id="console-body" class="console-body">
+            <div class="log-line log-system">Pipeline stream initialized. Ready for events.</div>
+          </div>
+        </div>
+
+          </div>
+        </div>
+
+        <!-- Right Pinned Panel (~38% width, collapsible): Antigravity Co-Pilot -->
+        <aside class="job-copilot-panel" id="job-copilot-panel">
+          <!-- Co-Pilot Panel Header -->
+          <div class="copilot-panel-header">
+            <div class="copilot-header-left">
+              <span class="copilot-title-icon">🤖</span>
+              <div class="copilot-title-group">
+                <div class="copilot-title">Antigravity Co-Pilot</div>
+                <div class="copilot-cli-badge"><code>agy --dangerously-skip-permissions</code></div>
+              </div>
+            </div>
+            <div class="copilot-header-right">
+              <span id="copilot-session-badge" class="session-badge" title="Active conversation session ID">Session: New</span>
+              <button id="btn-reset-copilot" class="btn btn-ghost btn-sm" title="Reset conversation session and clear context">
+                <span>🔄</span> Reset
+              </button>
+              <button id="btn-collapse-copilot" class="btn btn-ghost btn-sm btn-icon-only" title="Collapse Co-Pilot panel">
+                ✕
+              </button>
+            </div>
+          </div>
+
+          <!-- Scrollable Conversation Timeline -->
+          <div class="copilot-timeline" id="copilot-timeline">
+            <div class="copilot-welcome-card" id="copilot-welcome-card">
+              <div class="welcome-icon">⚡</div>
+              <div class="welcome-title">Zero Window-Switching Workspace</div>
+              <p class="welcome-text">
+                Ask Antigravity to adjust EDL cut points, pitch alternate hooks, edit motion graphics scripts, inspect QA metrics, or rewrite viral social copy. Edits apply directly to your active job in real-time.
+              </p>
+            </div>
+          </div>
+
+          <!-- Quick Action Chips -->
+          <div class="copilot-quick-chips" id="copilot-quick-chips">
+            <button type="button" class="copilot-chip" data-prompt="Pitch 3 sharper hooks">💡 Pitch 3 sharper hooks</button>
+            <button type="button" class="copilot-chip" data-prompt="Tighten clipped words in EDL">✂️ Tighten clipped words in EDL</button>
+            <button type="button" class="copilot-chip" data-prompt="Review graphics snapshots">🎨 Review graphics snapshots</button>
+            <button type="button" class="copilot-chip" data-prompt="Rewrite 5 descriptions">📝 Rewrite 5 descriptions</button>
+          </div>
+
+          <!-- Composer Bar -->
+          <div class="copilot-composer">
+            <div class="copilot-input-wrap">
+              <textarea id="copilot-input" class="copilot-textarea" rows="2" placeholder="Ask Antigravity to adjust EDL, refine hooks, or tweak motion... (Enter to send, Shift+Enter for newline)"></textarea>
+            </div>
+            <div class="copilot-composer-footer">
+              <div class="copilot-model-select-wrap">
+                <label for="copilot-model-select" class="copilot-model-label">Model:</label>
+                <select id="copilot-model-select" class="studio-select text-xs copilot-model-dropdown">
+                  <option value="gemini-3.8-flash-high">Gemini 3.8 Flash High</option>
+                </select>
+                <span id="copilot-quota-badge" class="quota-pill hidden">⚠️ High Quota</span>
+              </div>
+              <button id="btn-send-copilot" class="btn btn-primary btn-sm btn-copilot-submit">
+                <span class="btn-copilot-label">Ask Antigravity</span>
+                <span id="copilot-spinner" class="copilot-loader hidden"></span>
+              </button>
+            </div>
+          </div>
+        </aside>
+
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Notification Toast Container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- Vanilla ES Module Script -->
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

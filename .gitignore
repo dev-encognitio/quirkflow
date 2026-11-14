@@ -1,0 +1,47 @@
+# Environments & Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+*secret*
+*token*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+
+# Pipeline Runtime & Media Artifacts
+jobs/
+raw_clips/
+work/
+cover/
+final/
+hf/snapshots/
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
