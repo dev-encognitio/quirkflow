@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -292,60 +293,181 @@ def validate_and_fix_edl_overlaps(
             e = s + 0.5
         part["range"] = [round(s, 3), round(e, 3)]
         part["hold"] = max(0.0, float(part.get("hold", 0.0)))
+
+        # Snap/repair misaligned ranges against word timestamps so build.py match() succeeds.
+        clip_id = str(part.get("clip", ""))
+        words = (words_by_clip or {}).get(clip_id, [])
+        say = str(part.get("say", "")).strip()
+        if words and say:
+            in_range = _find_word_match_span(words, say, target_range=part["range"], restrict_to_range=True)
+            if in_range is None:
+                best_span = _find_word_match_span(words, say, target_range=part["range"], restrict_to_range=False)
+                if best_span is not None:
+                    cand_s, cand_e = best_span
+                    # Floor start / ceil end to 3 decimals so build.py's rng[0] <= word_start <= rng[1] always holds.
+                    s_aligned = math.floor(max(0.0, cand_s) * 1000.0) / 1000.0
+                    e_aligned = math.ceil(cand_e * 1000.0) / 1000.0
+                    if e_aligned <= s_aligned:
+                        e_aligned = round(s_aligned + 0.2, 3)
+                    part["range"] = [s_aligned, e_aligned]
+
         fixed_parts.append(part)
 
-    # Clean overlaps across consecutive parts of the same clip
+    # Clean true chronological overlaps across consecutive parts of the same clip.
+    # Disjoint reorders (forward: eff_curr_end <= nxt_start, or backward: nxt_end <= curr_start)
+    # must remain untouched.
     for i in range(len(fixed_parts) - 1):
         curr = fixed_parts[i]
         nxt = fixed_parts[i + 1]
-
-        if curr.get("clip") == nxt.get("clip"):
-            curr_start, curr_end = curr["range"]
-            nxt_start, nxt_end = nxt["range"]
-            effective_curr_end = curr_end + curr.get("hold", 0.0)
-
-            # Check if current part overlaps next part
-            if effective_curr_end >= nxt_start:
-                clip_id = curr.get("clip", "")
-                words = (words_by_clip or {}).get(clip_id, [])
-
-                # Attempt word boundary resolution
-                resolved = False
-                if words:
-                    # Find last word of current segment and first word of next segment
-                    curr_words = [
-                        w for w in words if curr_start <= float(w[1]) <= curr_end
-                    ]
-                    nxt_words = [
-                        w for w in words if nxt_start <= float(w[1]) <= nxt_end
-                    ]
-
-                    if curr_words and nxt_words:
-                        last_curr_end = float(curr_words[-1][2])
-                        first_nxt_start = float(nxt_words[0][1])
-
-                        if first_nxt_start > last_curr_end:
-                            split_pt = round((last_curr_end + first_nxt_start) / 2.0, 3)
-                            curr["range"][1] = split_pt
-                            nxt["range"][0] = split_pt
-                            curr["hold"] = 0.0
-                            resolved = True
-
-                if not resolved:
-                    # Deterministic midpoint split with 0.02s gap
-                    mid = round((curr_end + nxt_start) / 2.0, 3)
-                    curr["range"][1] = max(round(curr_start + 0.1, 3), round(mid - 0.02, 3))
-                    nxt["range"][0] = min(round(nxt_end - 0.1, 3), round(mid + 0.02, 3))
-                    curr["hold"] = 0.0
-
-            # Guard against invalid ranges after adjustment
-            if curr["range"][1] <= curr["range"][0]:
-                curr["range"][1] = round(curr["range"][0] + 0.2, 3)
-            if nxt["range"][0] >= nxt["range"][1]:
-                nxt["range"][1] = round(nxt["range"][0] + 0.2, 3)
+        if curr.get("clip") != nxt.get("clip"):
+            continue
+        _resolve_same_clip_overlap(curr, nxt, (words_by_clip or {}).get(str(curr.get("clip", "")), []))
 
     fixed_edl["parts"] = fixed_parts
     return fixed_edl
+
+
+def _norm_token(text: str) -> str:
+    """Normalize a word token using the exact regex expected by build.py."""
+    return re.sub(r"[^a-z0-9']", "", str(text).lower())
+
+
+def _find_word_match_span(
+    words: list[list[Any]],
+    say: str,
+    target_range: list[float] | None = None,
+    restrict_to_range: bool = True,
+) -> tuple[float, float] | None:
+    """Locate the [start, end] word span matching `say` with >= 0.80 token overlap."""
+    toks = [t for t in (_norm_token(x) for x in say.split()) if t]
+    if not toks or len(words) < len(toks):
+        return None
+
+    lo = float(target_range[0]) if (restrict_to_range and target_range) else None
+    hi = float(target_range[1]) if (restrict_to_range and target_range) else None
+    ws = [
+        (_norm_token(str(w[0])), float(w[1]), float(w[2]))
+        for w in words
+        if lo is None or (lo <= float(w[1]) <= hi)
+    ]
+    if len(ws) < len(toks):
+        return None
+
+    ref_s = float(target_range[0]) if target_range else 0.0
+    ref_e = float(target_range[1]) if target_range else 0.0
+    best_in_range: tuple[float, float, float] | None = None
+    candidates: list[tuple[int, float, float, float, float]] = []
+
+    for i in range(len(ws) - len(toks) + 1):
+        score = sum(a == b for a, b in zip(toks, (w[0] for w in ws[i : i + len(toks)]))) / len(toks)
+        if score < 0.8:
+            continue
+        cand_s = ws[i][1]
+        cand_e = ws[i + len(toks) - 1][2]
+        if restrict_to_range:
+            if best_in_range is None or score > best_in_range[0]:
+                best_in_range = (score, cand_s, cand_e)
+        else:
+            dist = abs(cand_s - ref_s) + abs(cand_e - ref_e)
+            is_far = 0 if dist <= 1.0 else 1
+            candidates.append((is_far, -round(score, 3), dist, cand_s, cand_e))
+
+    if restrict_to_range:
+        return (best_in_range[1], best_in_range[2]) if best_in_range else None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    _, _, _, best_s, best_e = candidates[0]
+    return (best_s, best_e)
+
+
+def _resolve_same_clip_overlap(
+    curr: dict[str, Any],
+    nxt: dict[str, Any],
+    words: list[list[Any]],
+) -> None:
+    """Resolve true chronological overlap between adjacent EDL parts on the same clip."""
+    curr_start, curr_end = curr["range"]
+    nxt_start, nxt_end = nxt["range"]
+    effective_curr_end = curr_end + curr.get("hold", 0.0)
+
+    # Disjoint forward OR disjoint non-chronological backward jump -> never modify either range.
+    if effective_curr_end <= nxt_start or nxt_end <= curr_start:
+        return
+
+    # Only hold exceeded nxt_start; drop hold without altering speech ranges.
+    if curr_end <= nxt_start:
+        curr["hold"] = 0.0
+        return
+
+    earlier, later = (curr, nxt) if curr_start <= nxt_start else (nxt, curr)
+    e_start, e_end = earlier["range"]
+    l_start, l_end = later["range"]
+
+    resolved = False
+    if words:
+        e_say = str(earlier.get("say", "")).strip()
+        l_say = str(later.get("say", "")).strip()
+        e_span = _find_word_match_span(words, e_say, earlier["range"], True) if e_say else None
+        l_span = _find_word_match_span(words, l_say, later["range"], True) if l_say else None
+        boundary: tuple[float, float] | None = None
+        if e_span and l_span:
+            boundary = (e_span[1], l_span[0])
+        else:
+            e_words = [w for w in words if e_start <= float(w[1]) <= e_end]
+            l_words = [w for w in words if l_start <= float(w[1]) <= l_end]
+            if e_words and l_words:
+                boundary = (float(e_words[-1][2]), float(l_words[0][1]))
+
+        if boundary and boundary[1] > boundary[0]:
+            split_pt = round((boundary[0] + boundary[1]) / 2.0, 3)
+            if e_start < split_pt < l_end:
+                earlier["range"][1] = split_pt
+                later["range"][0] = split_pt
+                curr["hold"] = 0.0
+                resolved = True
+
+    if not resolved:
+        overlap_s = l_start
+        overlap_e = min(e_end, l_end)
+        mid = round((overlap_s + overlap_e) / 2.0, 3)
+        earlier["range"][1] = max(round(e_start + 0.1, 3), round(mid - 0.02, 3))
+        later["range"][0] = min(round(l_end - 0.1, 3), round(mid + 0.02, 3))
+        curr["hold"] = 0.0
+
+    if earlier["range"][1] <= earlier["range"][0]:
+        earlier["range"][1] = round(earlier["range"][0] + 0.2, 3)
+    if later["range"][0] >= later["range"][1]:
+        later["range"][1] = round(later["range"][0] + 0.2, 3)
+
+
+def format_words_for_edl(words_by_clip: dict[str, list[list[Any]]], max_chars: int = 45000) -> str:
+    """Serialize word timestamps for the EDL prompt without truncating clips mid-JSON."""
+    compact = json.dumps(words_by_clip, separators=(",", ":"))
+    if len(compact) <= max_chars:
+        return compact
+
+    dense_dict = {
+        str(cid): " ".join(f"{w[0]}@{round(float(w[1]), 2)}" for w in ws if len(w) >= 2)
+        for cid, ws in words_by_clip.items()
+    }
+    dense = json.dumps(dense_dict, separators=(",", ":"))
+    if len(dense) <= max_chars:
+        return dense
+
+    total_len = sum(len(v) for v in dense_dict.values()) or 1
+    usable = max(200, max_chars - 64 - 16 * len(dense_dict))
+    bounded: dict[str, str] = {}
+    for cid, text in dense_dict.items():
+        share = max(80, int(usable * len(text) / total_len))
+        if len(text) <= share:
+            bounded[cid] = text
+        else:
+            cut = text[: max(0, share - 4)]
+            if " " in cut:
+                cut = cut.rsplit(" ", 1)[0]
+            bounded[cid] = cut + " ..."
+    return json.dumps(bounded, separators=(",", ":"))
 
 
 # ============================================================================

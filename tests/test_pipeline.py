@@ -163,6 +163,108 @@ class TestPresetsAndEdl:
         p1 = fixed["parts"][0]
         p2 = fixed["parts"][1]
         assert p1["range"][1] <= p2["range"][0]
+        # Spoken words must remain enclosed by their repaired ranges (never split mid-word)
+        assert p1["range"][0] <= 1.2 and 2.0 <= p1["range"][1]
+        assert p2["range"][0] <= 4.5 and 5.2 <= p2["range"][1]
+
+    def test_validate_and_fix_edl_overlaps_non_chronological_jumps(self):
+        edl = {
+            "title": "Non-chronological Narrative Order",
+            "parts": [
+                {"id": "p01", "clip": "c01", "range": [31.75, 32.59], "say": "pineapple on pizza", "hold": 0.05},
+                {"id": "p02", "clip": "c01", "range": [47.19, 47.87], "say": "unmask yourself", "hold": 0.05},
+                {"id": "p03", "clip": "c01", "range": [28.59, 31.25], "say": "something people debate", "hold": 0.05},
+                {"id": "p04", "clip": "c01", "range": [131.0, 139.38], "say": "probably cannot change opinion", "hold": 0.0},
+                {"id": "p05", "clip": "c01", "range": [67.26, 70.62], "say": "express our personalities", "hold": 0.1},
+            ],
+        }
+        fixed = validate_and_fix_edl_overlaps(edl)
+        expected = [
+            ([31.75, 32.59], 0.05),
+            ([47.19, 47.87], 0.05),
+            ([28.59, 31.25], 0.05),
+            ([131.0, 139.38], 0.0),
+            ([67.26, 70.62], 0.1),
+        ]
+        for part, (exp_rng, exp_hold) in zip(fixed["parts"], expected):
+            assert part["range"] == exp_rng
+            assert part["hold"] == exp_hold
+
+    def test_validate_and_fix_edl_overlaps_repairs_crushed_or_shifted_word_ranges(self):
+        words_by_clip = {
+            "c01": [
+                ["something", 28.59, 29.01],
+                ["where", 29.13, 29.51],
+                ["people", 29.57, 29.83],
+                ["unmask", 45.23, 45.9],
+                ["yourself", 45.9, 46.97],
+                ["unmask", 47.19, 47.59],
+                ["yourself", 47.59, 47.87],
+                ["allow", 67.26, 67.8],
+                ["ourselves", 68.56, 69.2],
+                ["personalities", 70.2, 70.62],
+            ]
+        }
+        edl = {
+            "title": "Repair Crushed Ranges",
+            "parts": [
+                # Nearest occurrence (47.19..47.87) should win over earlier (45.23..46.97)
+                {"id": "p01", "clip": "c01", "range": [47.19, 47.29], "say": "unmask yourself", "hold": 0.0},
+                # Crushed to trailing 0.10s at end
+                {"id": "p02", "clip": "c01", "range": [31.15, 31.25], "say": "something where people", "hold": 0.05},
+                # Slightly shifted past first word start
+                {"id": "p03", "clip": "c01", "range": [67.35, 70.62], "say": "allow ourselves personalities", "hold": 0.0},
+            ],
+        }
+        fixed = validate_and_fix_edl_overlaps(edl, words_by_clip=words_by_clip)
+        assert fixed["parts"][0]["range"] == [47.19, 47.87]
+        assert fixed["parts"][1]["range"] == [28.59, 29.83]
+        assert fixed["parts"][2]["range"] == [67.26, 70.62]
+
+    def test_validate_and_fix_edl_overlaps_hold_nested_and_reverse_partial(self):
+        edl = {
+            "title": "Edge Overlaps",
+            "parts": [
+                # Hold-only overlap: hold pushes 5.0 + 0.5 > 5.2, speech ranges disjoint
+                {"id": "p01", "clip": "c01", "range": [1.0, 5.0], "say": "", "hold": 0.5},
+                {"id": "p02", "clip": "c01", "range": [5.2, 8.0], "say": "", "hold": 0.0},
+                # Nested overlap on c02
+                {"id": "p03", "clip": "c02", "range": [2.0, 12.0], "say": "", "hold": 0.0},
+                {"id": "p04", "clip": "c02", "range": [4.0, 6.0], "say": "", "hold": 0.0},
+                # Reverse partial overlap on c03 ([10, 15] then [8, 11])
+                {"id": "p05", "clip": "c03", "range": [10.0, 15.0], "say": "", "hold": 0.1},
+                {"id": "p06", "clip": "c03", "range": [8.0, 11.0], "say": "", "hold": 0.0},
+            ],
+        }
+        fixed = validate_and_fix_edl_overlaps(edl)
+        p1, p2, p3, p4, p5, p6 = fixed["parts"]
+
+        assert p1["range"] == [1.0, 5.0] and p1["hold"] == 0.0
+        assert p2["range"] == [5.2, 8.0]
+
+        assert p3["range"][0] < p3["range"][1] <= p4["range"][0] < p4["range"][1]
+        assert p6["range"][0] < p6["range"][1] <= p5["range"][0] < p5["range"][1]
+        assert p5["hold"] == 0.0
+
+    def test_format_words_for_edl_preserves_all_clips_past_6000_chars(self):
+        from agent_prompts import format_words_for_edl
+
+        words_by_clip = {
+            "c01": [[f"alpha{i}", round(i * 0.5, 2), round(i * 0.5 + 0.3, 2)] for i in range(450)],
+            "c02": [["beta", 0.25, 0.75], ["second", 0.8, 1.2]],
+            "c03": [["gamma", 1.0, 1.5], ["third", 1.6, 2.0]],
+        }
+        full_formatted = format_words_for_edl(words_by_clip)
+        assert len(full_formatted) > 6000
+        parsed = json.loads(full_formatted)
+        assert set(parsed.keys()) == {"c01", "c02", "c03"}
+        assert len(parsed["c01"]) == 450
+        assert parsed["c03"][-1][0] == "third"
+
+        # When forced under a tight cap, output must remain valid JSON with all clips present
+        capped = format_words_for_edl(words_by_clip, max_chars=400)
+        parsed_capped = json.loads(capped)
+        assert set(parsed_capped.keys()) == {"c01", "c02", "c03"}
 
 
 # ============================================================================

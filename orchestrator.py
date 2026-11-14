@@ -41,6 +41,7 @@ try:
         build_edl_prompt,
         build_script_critic_prompt,
         build_script_generation_prompt,
+        format_words_for_edl,
         validate_and_fix_edl_overlaps,
     )
     from .presets import (
@@ -70,6 +71,7 @@ except ImportError:
         build_edl_prompt,
         build_script_critic_prompt,
         build_script_generation_prompt,
+        format_words_for_edl,
         validate_and_fix_edl_overlaps,
     )
     from presets import (
@@ -861,7 +863,8 @@ class JobManager:
                         raise FileNotFoundError("selected_script.json missing. Gate A approval required.")
 
                     selected_script = json.loads(selected_script_file.read_text())
-                    words_summary = (work_dir / "words.json").read_text()[:6000]
+                    words_by_clip = json.loads((work_dir / "words.json").read_text())
+                    words_summary = format_words_for_edl(words_by_clip)
                     transcript_text = (work_dir / "transcript_all.txt").read_text()
 
                     _log(f"[EDL] Generating Edit Decision List (EDL) via AGY ({mechanical_model})...")
@@ -874,7 +877,6 @@ class JobManager:
                         log_cb=_log,
                     )
 
-                    words_by_clip = json.loads((work_dir / "words.json").read_text())
                     clean_edl = validate_and_fix_edl_overlaps(raw_edl, words_by_clip)
                     (work_dir / "edl.json").write_text(json.dumps(clean_edl, indent=2))
 
