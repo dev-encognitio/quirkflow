@@ -710,6 +710,15 @@ class TestAgyModelsAndCopilot:
         assert res2_copilot == {"count": 42}
         assert res2_copilot != {"greeting": "hello"}
 
+        # Interrupted / ERROR envelope must not be returned as a valid schema payload
+        envelope_error = json.dumps({
+            "conversation_id": "conv-err",
+            "status": "ERROR",
+            "response": "",
+            "error": "interrupted",
+        })
+        assert _extract_json_payload(envelope_error, prefer_structured=True) is None
+
     def test_job_manager_models_update_and_enrich(self):
         with tempfile.TemporaryDirectory() as td:
             jm = JobManager(jobs_root=Path(td))
@@ -719,10 +728,36 @@ class TestAgyModelsAndCopilot:
             # Defaults populated
             assert job["config"]["models"] == DEFAULT_MODEL_SETTINGS
 
-            # Update models
+            # Update creative model only
             updated = jm.update_job_models(job_id, {"creative_model": "gemini-4-hydrogen-high"})
             assert updated["creative_model"] == "gemini-4-hydrogen-high"
             assert updated["mechanical_model"] == "gemini-3.8-flash-high"
+            assert updated["vision_model"] == "gemini-3.8-flash-high"
+
+            # Updating mechanical_model without explicit vision_model keeps Vision & Covers synced
+            updated_mech = jm.update_job_models(job_id, {"mechanical_model": "gemini-4-hydrogen-medium"})
+            assert updated_mech["mechanical_model"] == "gemini-4-hydrogen-medium"
+            assert updated_mech["vision_model"] == "gemini-4-hydrogen-medium"
+
+            # Explicit vision_model override is still honored
+            updated_vis = jm.update_job_models(job_id, {"vision_model": "gemini-4-hydrogen-high"})
+            assert updated_vis["mechanical_model"] == "gemini-4-hydrogen-medium"
+            assert updated_vis["vision_model"] == "gemini-4-hydrogen-high"
+
+            # Creating a job with mechanical_model syncs vision_model unless explicitly set
+            job_custom = jm.create_job(
+                preset_id="story_vertical",
+                clip_paths=[],
+                config={
+                    "models": {
+                        "creative_model": "gemini-4-hydrogen-xhigh",
+                        "mechanical_model": "gemini-4-hydrogen-medium",
+                    }
+                },
+            )
+            assert job_custom["config"]["models"]["creative_model"] == "gemini-4-hydrogen-xhigh"
+            assert job_custom["config"]["models"]["mechanical_model"] == "gemini-4-hydrogen-medium"
+            assert job_custom["config"]["models"]["vision_model"] == "gemini-4-hydrogen-medium"
 
             # Enriched job retains models
             refreshed = jm.get_job(job_id)

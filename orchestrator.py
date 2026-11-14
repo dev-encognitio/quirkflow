@@ -360,6 +360,8 @@ class JobManager:
             slot: validate_model_id(user_models.get(slot, default_val))
             for slot, default_val in DEFAULT_MODEL_SETTINGS.items()
         }
+        if "mechanical_model" in user_models and "vision_model" not in user_models:
+            models_dict["vision_model"] = models_dict["mechanical_model"]
 
         job_config = {
             "preset_id": pid,
@@ -431,6 +433,14 @@ class JobManager:
                 updated_models[slot] = validate_model_id(current_models[slot])
             else:
                 updated_models[slot] = default_val
+
+        # Vision QA shares the Mechanical & QA selector unless explicitly overridden.
+        if (
+            "mechanical_model" in models_patch
+            and models_patch["mechanical_model"]
+            and not ("vision_model" in models_patch and models_patch["vision_model"])
+        ):
+            updated_models["vision_model"] = updated_models["mechanical_model"]
 
         job["config"]["models"] = updated_models
         self._save_job(job)
@@ -771,7 +781,7 @@ class JobManager:
             cfg_models = job.get("config", {}).get("models", {})
             creative_model = validate_model_id(cfg_models.get("creative_model"))
             mechanical_model = validate_model_id(cfg_models.get("mechanical_model"))
-            vision_model = validate_model_id(cfg_models.get("vision_model"))
+            vision_model = validate_model_id(cfg_models.get("vision_model") or mechanical_model)
 
             try:
                 # -------------------------------------------------------------

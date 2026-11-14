@@ -676,7 +676,8 @@ async function patchJobModels() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         creative_model: creative,
-        mechanical_model: mechanical
+        mechanical_model: mechanical,
+        vision_model: mechanical
       })
     });
     if (res.ok) {
@@ -776,7 +777,7 @@ async function triggerGenerateVideo() {
   const creativeModel = document.getElementById("select-creative-model")?.value || state.defaultModels.creative_model;
   const mechanicalModel = document.getElementById("select-mechanical-model")?.value || state.defaultModels.mechanical_model;
   const copilotModel = document.getElementById("copilot-model-select")?.value || state.defaultModels.copilot_model;
-  const visionModel = state.defaultModels.vision_model || mechanicalModel;
+  const visionModel = mechanicalModel;
 
   const payload = {
     config: {

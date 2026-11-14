@@ -265,6 +265,8 @@ def _extract_json_payload(raw_text: str, prefer_structured: bool = False) -> Any
                 return parsed["result"]
             if "content" in parsed and isinstance(parsed["content"], str):
                 text = parsed["content"].strip()
+            if parsed.get("status") == "ERROR":
+                return None
         else:
             return parsed
     except Exception:
@@ -341,6 +343,8 @@ async def run_agy_json(
 
     parsed = _extract_json_payload(out, prefer_structured=(schema is not None))
     if parsed is None:
+        if code != 0:
+            raise RuntimeError(f"AGY execution failed (code {code}): {err or out[:500]}")
         raise ValueError(f"Failed to extract JSON from AGY response:\n{out[:500]}")
     return parsed
 
@@ -1294,7 +1298,7 @@ async def run_motion_graphics(
             prompt,
             schema=HYPERFRAMES_SCHEMA,
             model=creative_model,
-            timeout_s=180.0,
+            timeout_s=600.0,
             cancel_event=cancel_event,
             log_cb=log_cb,
         )
