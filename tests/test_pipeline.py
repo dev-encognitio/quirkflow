@@ -993,8 +993,38 @@ class TestPipelineRegressionFixes:
             check_data = json.loads(res.stdout)
             assert check_data.get("ok") is True
             assert check_data.get("lint", {}).get("errorCount", 0) == 0
+            assert check_data.get("runtime", {}).get("warningCount", 0) == 0, check_data.get("runtime")
+            assert check_data.get("layout", {}).get("warningCount", 0) == 0, check_data.get("layout")
+            craft_codes = [f.get("code") for f in check_data.get("craft", {}).get("findings", [])]
+            assert "dead_stretch" not in craft_codes, craft_codes
             has_issues, issues = adapters._extract_check_issues(res.stdout)
             assert not has_issues, f"Unexpected check issues on fallback composition: {issues}"
+
+            # Also verify pl+dl with strokes+dots+pop(label) produces ZERO GSAP console_warning / gsap_tween_tail / outside_safe_zone
+            mixed_scenes = '''
+draw("s0", pl("M160 1280 L340 1280", 6, W) + dl("M160 1320 L340 1320", 4, L));
+label("s0_lbl", "UNMASK YOURSELF", 420, 1240, {w: 400, size: 52, col: T});
+tl.set("#s0,#s0_lbl", {opacity: 1}, 0);
+tl.set("#s0 .ln[pathLength]", {strokeDashoffset: 0}, 0);
+strokes("s0", 0.3, 0.4, 0.05);
+dots("s0", 0.5, 0.4, 0.05);
+pop("s0_lbl", 0.8, "center center");
+pulse("#s0", "250px 1280px", 1.8, 1.07);
+out("#s0,#s0_lbl", 3.6, 12);
+'''
+            (hf_dir / "index.html").write_text(render_hyperframes_index_html(preset, mixed_scenes, 4.0))
+            (hf_dir / "cues.json").write_text(json.dumps({"total": 4.0}))
+            (hf_dir / "cues.js").write_text("window.CUES={total:4.0};\n")
+            res2 = subprocess.run(
+                [adapters.HYPERFRAMES_BIN, "check", str(hf_dir), "--json"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            assert res2.returncode == 0, res2.stdout
+            check2 = json.loads(res2.stdout)
+            assert check2.get("runtime", {}).get("warningCount", 0) == 0, check2.get("runtime")
+            assert check2.get("layout", {}).get("warningCount", 0) == 0, check2.get("layout")
 
     @pytest.mark.asyncio
     async def test_run_build_and_qa_merges_edl_highlights_gamma_and_checks_rebuild(self):
@@ -1244,6 +1274,81 @@ class TestPipelineRegressionFixes:
             assert restarted["stages"]["edl"]["status"] == "pending"
             assert restarted["stages"]["edl"]["error"] is None
             assert restarted["stages"]["base_cut"]["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_legacy_job_vision_model_tracks_mechanical_model_and_bbox_sheet_helpers(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as td:
+            jm = JobManager(jobs_root=Path(td))
+            job = jm.create_job(preset_id="story_vertical", clip_paths=[])
+            jid = job["id"]
+            job_dir = jm.jobs_root / jid
+            work_dir = job_dir / "work"
+            (work_dir / "assets" / "bgm" / "candidates").mkdir(parents=True, exist_ok=True)
+            (work_dir / "assets" / "bgm" / "candidates" / "track.mp3").write_bytes(b"ID3")
+
+            # Simulate legacy job.json with user setting mechanical_model=gemini-4-hydrogen-medium
+            # while vision_model lingered on gemini-3.8-flash-high without vision_model_explicit
+            j = jm.get_job(jid)
+            j["config"]["models"] = {
+                "creative_model": "gemini-4-hydrogen-xhigh",
+                "mechanical_model": "gemini-4-hydrogen-medium",
+                "vision_model": "gemini-3.8-flash-high",
+                "copilot_model": "gemini-3.8-flash-high",
+            }
+            j["config"].pop("vision_model_explicit", None)
+            jm._save_job(j)
+
+            with mock.patch("server.JOBS_ROOT", Path(td)):
+                enriched = enrich_job(jm.get_job(jid))
+            assert enriched["config"]["models"]["vision_model"] == "gemini-4-hydrogen-medium"
+
+            captured_models: dict[str, str] = {}
+
+            async def fake_graphics(*args, **kwargs):
+                captured_models["creative_model"] = kwargs.get("creative_model", "")
+                captured_models["vision_model"] = kwargs.get("vision_model", "")
+                captured_models["mechanical_model"] = kwargs.get("mechanical_model", "")
+                return {"overlay_mov": "x", "snapshots_dir": "y"}
+
+            with mock.patch("orchestrator.run_motion_graphics", side_effect=fake_graphics), mock.patch(
+                "orchestrator.run_composite", return_value={"final_mp4": "x"}
+            ), mock.patch(
+                "orchestrator.run_deliverables", return_value={"covers": [], "descriptions": {}}
+            ):
+                ev = asyncio.Event()
+                await jm._run_job_loop(jid, from_stage="graphics", force=True, cancel_event=ev)
+
+            assert captured_models["creative_model"] == "gemini-4-hydrogen-xhigh"
+            assert captured_models["mechanical_model"] == "gemini-4-hydrogen-medium"
+            assert captured_models["vision_model"] == "gemini-4-hydrogen-medium"
+
+            # Verify Pillow snapshot bbox & cover contact sheet helpers
+            snap_dir = job_dir / "snaps"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            blank_png = snap_dir / "frame-00-at-0s.png"
+            Image.new("RGBA", (1080, 1920), (0, 0, 0, 0)).save(blank_png)
+            text, has_issues, issues = adapters._inspect_snapshots_bbox(snap_dir, get_preset("story_vertical"))
+            assert has_issues is True
+            assert "BLANK" in text
+            assert any("blank" in i.lower() for i in issues)
+
+            # Now draw content in safe band y=1200..1340 and re-verify
+            ok_img = Image.new("RGBA", (1080, 1920), (0, 0, 0, 0))
+            ImageDraw.Draw(ok_img).rectangle([160, 1200, 620, 1340], fill=(255, 138, 61, 255))
+            ok_img.save(blank_png)
+            text2, has_issues2, _ = adapters._inspect_snapshots_bbox(snap_dir, get_preset("story_vertical"))
+            assert has_issues2 is False
+            assert "x=160..621, y=1200..1341" in text2
+
+            cands = []
+            for idx in range(1, 5):
+                cp = job_dir / f"cand_{idx:02d}.png"
+                Image.new("RGB", (270, 480), (20 * idx, 60, 120)).save(cp)
+                cands.append(str(cp))
+            sheet_path = adapters._build_cover_contact_sheet(cands, job_dir / "cover_sheet.jpg")
+            assert sheet_path and Path(sheet_path).exists()
 
 
 

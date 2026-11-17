@@ -1329,6 +1329,44 @@ def _extract_check_issues(check_out: str) -> tuple[bool, list[str]]:
         return False, []
 
 
+def _inspect_snapshots_bbox(snapshots_dir: Path, preset: dict[str, Any]) -> tuple[str, bool, list[str]]:
+    """Inspect rendered snapshot PNG alpha bounds cleanly via Pillow in <100ms."""
+    pngs = sorted(snapshots_dir.glob("frame-*.png"))
+    if not pngs:
+        return "No snapshot PNGs generated.", True, ["Snapshot generation produced no PNG frames"]
+    try:
+        from PIL import Image
+    except ImportError:
+        return "", False, []
+
+    c_top = int((preset or {}).get("caption_band", {}).get("top", 1500))
+    lines: list[str] = []
+    issues: list[str] = []
+    blank_count = 0
+
+    for idx, p in enumerate(pngs):
+        try:
+            with Image.open(p).convert("RGBA") as img:
+                bbox = img.getchannel("A").getbbox()
+                if not bbox:
+                    blank_count += 1
+                    lines.append(f"- {p.name}: BLANK (0 visible pixels)")
+                    if idx == 0:
+                        issues.append(f"{p.name}: opening frame at t=0 is blank")
+                else:
+                    x0, y0, x1, y1 = bbox
+                    lines.append(f"- {p.name}: visible bbox x={x0}..{x1}, y={y0}..{y1}")
+                    if y1 > c_top + 10:
+                        issues.append(f"{p.name}: graphics extend to y={y1} (into caption band y>={c_top})")
+        except Exception as e:
+            lines.append(f"- {p.name}: inspect error ({e})")
+
+    if blank_count == len(pngs):
+        issues.append("All sampled keyframe snapshots are completely blank")
+
+    return "\n".join(lines), len(issues) > 0, issues
+
+
 async def run_motion_graphics(
     job_dir: Path,
     preset: dict[str, Any],
@@ -1410,8 +1448,8 @@ async def run_motion_graphics(
             prompt,
             schema=HYPERFRAMES_SCENE_SCHEMA,
             model=creative_model,
-            cwd=hf_dir,
-            add_dirs=[hf_dir],
+            cwd=None,
+            add_dirs=None,
             timeout_s=360.0,
             cancel_event=cancel_event,
             log_cb=log_cb,
@@ -1450,15 +1488,29 @@ async def run_motion_graphics(
         cancel_event=cancel_event,
     )
 
+    bbox_text, has_bbox_issues, bbox_issues = _inspect_snapshots_bbox(snapshots_dir, preset)
+    contact_sheet = snapshots_dir / "contact-sheet.jpg"
+    if not contact_sheet.exists():
+        pngs = sorted(snapshots_dir.glob("frame-*.png"))
+        contact_sheet = pngs[0] if pngs else snapshots_dir
+
+    beats_summary = json.dumps(cues_data, indent=1)[:2200]
     critique_res: dict[str, Any] = {"passes": True, "critique": "", "issues": [], "fixes_needed": []}
     try:
-        critique_prompt = build_vision_critique_prompt(str(snapshots_dir), str(hf_dir / "cues.json"), preset)
+        critique_prompt = build_vision_critique_prompt(
+            str(contact_sheet),
+            "",
+            preset,
+            telemetry_text=bbox_text,
+            beats_summary=beats_summary,
+        )
         critique_res = await run_agy_json(
             critique_prompt,
             schema=VISION_CRITIQUE_SCHEMA,
             model=vision_model,
-            cwd=job_dir,
-            add_dirs=[snapshots_dir, hf_dir],
+            cwd=snapshots_dir,
+            add_dirs=[snapshots_dir],
+            timeout_s=120.0,
             cancel_event=cancel_event,
             log_cb=log_cb,
         )
@@ -1470,10 +1522,11 @@ async def run_motion_graphics(
     needs_revision = (
         check_code != 0
         or has_check_issues
+        or has_bbox_issues
         or (isinstance(critique_res, dict) and critique_res.get("passes") is False)
     )
     if needs_revision:
-        combined_issues = list(check_issues) + list(critique_res.get("issues", []))
+        combined_issues = list(check_issues) + list(bbox_issues) + list(critique_res.get("issues", []))
         fixes_needed = list(critique_res.get("fixes_needed", []))
         if log_cb:
             log_cb(f"[GRAPHICS] Critique/check flagged {len(combined_issues)} issues — running targeted revision via AGY ({creative_model})...")
@@ -1491,8 +1544,8 @@ async def run_motion_graphics(
                 rev_prompt,
                 schema=HYPERFRAMES_SCENE_SCHEMA,
                 model=creative_model,
-                cwd=hf_dir,
-                add_dirs=[hf_dir],
+                cwd=None,
+                add_dirs=None,
                 timeout_s=300.0,
                 cancel_event=cancel_event,
                 log_cb=log_cb,
@@ -1747,6 +1800,41 @@ async def recomposite_studio(
     )
 
 
+def _build_cover_contact_sheet(candidate_frames: list[str], out_path: Path) -> str | None:
+    """Stitch candidate cover frames into one compact labeled 4x2 contact sheet JPEG."""
+    if not candidate_frames:
+        return None
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    tw, th = 270, 480
+    cols = min(4, len(candidate_frames))
+    rows = (len(candidate_frames) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * tw, rows * th), (18, 18, 22))
+    draw = ImageDraw.Draw(sheet)
+
+    for idx, frame_str in enumerate(candidate_frames):
+        fp = Path(frame_str)
+        if not fp.exists():
+            continue
+        try:
+            with Image.open(fp).convert("RGB") as im:
+                thumb = im.resize((tw, th), Image.Resampling.LANCZOS)
+        except Exception:
+            continue
+        x0 = (idx % cols) * tw
+        y0 = (idx // cols) * th
+        sheet.paste(thumb, (x0, y0))
+        tag = f"#{idx + 1}: {fp.name}"
+        draw.rectangle([x0 + 6, y0 + 6, x0 + 185, y0 + 30], fill=(0, 0, 0))
+        draw.text((x0 + 12, y0 + 10), tag, fill=(255, 220, 80))
+
+    sheet.save(out_path, quality=85)
+    return str(out_path) if out_path.exists() else None
+
+
 async def _extract_cover_candidates(
     work_dir: Path,
     cover_dir: Path,
@@ -1949,12 +2037,14 @@ async def run_deliverables(
         _generate_landscape_cover(frame_b, cover_dir / "cover_B", f"WHY {title_text}")
     else:
         sticker_cfg = await _extract_cover_sticker(work_dir, cover_dir, preset, cancel_event=cancel_event)
+        cover_sheet = _build_cover_contact_sheet(candidate_frames, cover_dir / "cover_sheet.jpg")
         try:
             cover_prompt = build_cover_prompt(
                 candidate_frames,
                 [title_text] + ([thesis_text] if thesis_text else []),
                 preset,
                 has_sticker=bool(sticker_cfg),
+                contact_sheet_path=cover_sheet,
             )
             sel_cover = await run_agy_json(
                 cover_prompt,
@@ -1962,7 +2052,9 @@ async def run_deliverables(
                 model=vision_model,
                 cwd=cover_dir,
                 add_dirs=[cover_dir],
+                timeout_s=120.0,
                 cancel_event=cancel_event,
+                log_cb=log_cb,
             )
         except Exception:
             words_t = title_text.upper().split()
@@ -1983,12 +2075,25 @@ async def run_deliverables(
                 },
             }
 
+        def _resolve_cover_frame(raw_ref: Any) -> str:
+            ref = str(raw_ref or "").strip()
+            if ref and Path(ref).exists():
+                return ref
+            base = Path(ref).name if ref else ""
+            for cf in candidate_frames:
+                if Path(cf).name == base:
+                    return cf
+            m_num = re.search(r"(\d+)", ref)
+            if m_num and candidate_frames:
+                idx = int(m_num.group(1))
+                if 1 <= idx <= len(candidate_frames):
+                    return candidate_frames[idx - 1]
+            return candidate_frames[0] if candidate_frames else ""
+
         for c_id, c_data in [("cover_A", sel_cover["cover_A"]), ("cover_B", sel_cover["cover_B"])]:
             cfg_path = cover_dir / f"{c_id}_config.json"
             layout = c_data.get("layout", "A" if c_id == "cover_A" else "B")
-            chosen_frame = c_data.get("frame", "")
-            if not Path(chosen_frame).exists() and candidate_frames:
-                chosen_frame = candidate_frames[0]
+            chosen_frame = _resolve_cover_frame(c_data.get("frame", ""))
             cfg_content: dict[str, Any] = {
                 "frame": chosen_frame,
                 "out": str(cover_dir / c_id),

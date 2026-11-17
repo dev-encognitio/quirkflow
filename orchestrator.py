@@ -362,6 +362,11 @@ class JobManager:
         }
         if "mechanical_model" in user_models and "vision_model" not in user_models:
             models_dict["vision_model"] = models_dict["mechanical_model"]
+        vision_explicit = bool(
+            "vision_model" in user_models
+            and user_models["vision_model"]
+            and models_dict["vision_model"] != models_dict["mechanical_model"]
+        )
 
         job_config = {
             "preset_id": pid,
@@ -371,6 +376,7 @@ class JobManager:
             "whisper_model": wm,
             "ai_broll": bp,
             "models": models_dict,
+            "vision_model_explicit": vision_explicit,
         }
 
         job = {
@@ -441,6 +447,11 @@ class JobManager:
             and not ("vision_model" in models_patch and models_patch["vision_model"])
         ):
             updated_models["vision_model"] = updated_models["mechanical_model"]
+            cfg["vision_model_explicit"] = False
+        elif "vision_model" in models_patch and models_patch["vision_model"]:
+            cfg["vision_model_explicit"] = (
+                updated_models["vision_model"] != updated_models["mechanical_model"]
+            )
 
         job["config"]["models"] = updated_models
         self._save_job(job)
@@ -824,10 +835,15 @@ class JobManager:
             self._save_job(job)
             self.publish(job_id, "stage_started", {"stage": stage, "stage_index": stage_idx})
 
-            cfg_models = job.get("config", {}).get("models", {})
+            cfg = job.get("config", {})
+            cfg_models = cfg.get("models", {})
             creative_model = validate_model_id(cfg_models.get("creative_model"))
             mechanical_model = validate_model_id(cfg_models.get("mechanical_model"))
-            vision_model = validate_model_id(cfg_models.get("vision_model") or mechanical_model)
+            vision_model = (
+                validate_model_id(cfg_models.get("vision_model") or mechanical_model)
+                if cfg.get("vision_model_explicit")
+                else mechanical_model
+            )
 
             try:
                 # -------------------------------------------------------------

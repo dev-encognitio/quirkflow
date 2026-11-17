@@ -664,11 +664,21 @@ function initModelRouting() {
   updateQuotaBadge(copilotSel, copilotQuotaBadge);
 }
 
-async function patchJobModels() {
+async function patchJobModels(silent = false) {
   if (!state.currentJobId) return;
   const creative = document.getElementById("mon-select-creative-model")?.value;
   const mechanical = document.getElementById("mon-select-mechanical-model")?.value;
   if (!creative || !mechanical) return;
+
+  const cur = state.currentJob?.config?.models || {};
+  if (
+    silent &&
+    cur.creative_model === creative &&
+    cur.mechanical_model === mechanical &&
+    cur.vision_model === mechanical
+  ) {
+    return;
+  }
 
   try {
     const res = await fetch(`/api/jobs/${state.currentJobId}/models`, {
@@ -681,19 +691,19 @@ async function patchJobModels() {
       })
     });
     if (res.ok) {
-      showToast("Updated AI models routing for job", "success");
+      if (!silent) showToast("Updated AI models routing for job", "success");
       const payload = await res.json().catch(() => null);
       if (payload?.job?.config) {
         state.currentJob = payload.job;
       } else if (payload?.config) {
         state.currentJob = payload;
       }
-    } else {
+    } else if (!silent) {
       const err = await res.json().catch(() => ({}));
       showToast(`Model update failed: ${err.detail || "Error"}`, "error");
     }
   } catch (err) {
-    showToast(`Model update error: ${err.message}`, "error");
+    if (!silent) showToast(`Model update error: ${err.message}`, "error");
   }
 }
 
@@ -1329,6 +1339,7 @@ function initJobControls() {
     if (!state.currentJobId) return;
     const stage = document.getElementById("select-retry-stage")?.value || "ingest";
     try {
+      await patchJobModels(true);
       const res = await fetch(`/api/jobs/${state.currentJobId}/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

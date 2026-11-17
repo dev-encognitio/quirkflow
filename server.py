@@ -111,6 +111,8 @@ def enrich_job(job: dict) -> dict:
         slot: validate_model_id(user_models.get(slot, default_val))
         for slot, default_val in DEFAULT_MODEL_SETTINGS.items()
     }
+    if not cfg.get("vision_model_explicit"):
+        cfg_models["vision_model"] = cfg_models["mechanical_model"]
     job["config"] = {
         "preset_id": cfg.get("preset_id") or job.get("preset_id", "story_vertical"),
         "story_prompt": cfg.get("story_prompt") if "story_prompt" in cfg else job.get("story_prompt", ""),
@@ -119,6 +121,7 @@ def enrich_job(job: dict) -> dict:
         "whisper_model": cfg.get("whisper_model") or job.get("whisper_model", "small.en"),
         "ai_broll": cfg.get("ai_broll") or job.get("broll_provider", "off"),
         "models": cfg_models,
+        "vision_model_explicit": bool(cfg.get("vision_model_explicit")),
     }
 
     # 2. Base video URL
