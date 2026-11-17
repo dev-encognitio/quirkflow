@@ -183,10 +183,17 @@ def enrich_job(job: dict) -> dict:
 
     # 6. BGM candidates
     bgm_list = []
+    seen_bgm_names: set[str] = set()
+    seen_bgm_paths: set[str] = set()
     for folder in [job_dir / "work" / "assets" / "bgm" / "candidates", job_dir / "work" / "assets" / "bgm", job_dir / "assets" / "bgm"]:
         if folder.exists():
             for p in sorted(folder.iterdir()):
                 if p.is_file() and p.suffix.lower() in {".mp3", ".wav", ".m4a", ".aac", ".ogg"}:
+                    resolved = str(p.resolve())
+                    if p.name in seen_bgm_names or resolved in seen_bgm_paths:
+                        continue
+                    seen_bgm_names.add(p.name)
+                    seen_bgm_paths.add(resolved)
                     rel = p.relative_to(job_dir)
                     bgm_list.append({
                         "id": p.stem,

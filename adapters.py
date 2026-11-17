@@ -32,16 +32,20 @@ try:
         DESCRIPTIONS_SCHEMA,
         EDL_SCHEMA,
         HYPERFRAMES_SCHEMA,
+        HYPERFRAMES_SCENE_SCHEMA,
         SCRIPT_OPTIONS_SCHEMA,
         VISION_CRITIQUE_SCHEMA,
         build_audio_spotcheck_prompt,
         build_cover_prompt,
         build_descriptions_prompt,
         build_edl_prompt,
+        build_fallback_scenes_js,
         build_hyperframes_prompt,
+        build_hyperframes_revision_prompt,
         build_script_critic_prompt,
         build_script_generation_prompt,
         build_vision_critique_prompt,
+        render_hyperframes_index_html,
         validate_and_fix_edl_overlaps,
     )
     from .presets import get_preset
@@ -53,16 +57,20 @@ except ImportError:
         DESCRIPTIONS_SCHEMA,
         EDL_SCHEMA,
         HYPERFRAMES_SCHEMA,
+        HYPERFRAMES_SCENE_SCHEMA,
         SCRIPT_OPTIONS_SCHEMA,
         VISION_CRITIQUE_SCHEMA,
         build_audio_spotcheck_prompt,
         build_cover_prompt,
         build_descriptions_prompt,
         build_edl_prompt,
+        build_fallback_scenes_js,
         build_hyperframes_prompt,
+        build_hyperframes_revision_prompt,
         build_script_critic_prompt,
         build_script_generation_prompt,
         build_vision_critique_prompt,
+        render_hyperframes_index_html,
         validate_and_fix_edl_overlaps,
     )
     from presets import get_preset
@@ -320,6 +328,8 @@ async def run_agy_json(
         "--output-format",
         "json",
         "--dangerously-skip-permissions",
+        "--disable-slash-commands",
+        "--new-project",
         "--model",
         model,
     ]
@@ -337,7 +347,8 @@ async def run_agy_json(
         schema_label = "structured schema" if schema else "freeform"
         log_cb(f"[AI] Invoking AGY ({model}) with {schema_label}...")
 
-    code, out, err = await _run_proc(cmd, cwd=cwd, timeout_s=timeout_s, cancel_event=cancel_event, log_cb=log_cb)
+    effective_cwd = cwd if cwd is not None else "/tmp"
+    code, out, err = await _run_proc(cmd, cwd=effective_cwd, timeout_s=timeout_s, cancel_event=cancel_event, log_cb=log_cb)
     if code != 0 and not out:
         raise RuntimeError(f"AGY execution failed (code {code}): {err}")
 
@@ -790,6 +801,12 @@ async def run_ingest_transcribe(
     if log_cb:
         log_cb(f"[INGEST] Average luma: {avg_luma:.1f} -> suggested gamma: {suggested_gamma}")
 
+    ingest_meta = {
+        "suggested_gamma": suggested_gamma,
+        "avg_luma": round(avg_luma, 1),
+    }
+    (work_dir / "ingest_meta.json").write_text(json.dumps(ingest_meta, indent=2))
+
     # Generate lighting contact sheet (3x3 grid)
     sheet_path = work_dir / "lighting_sheet.png"
     first_clip = src_dir / f"{list(clip_map.keys())[0]}.mp4"
@@ -877,6 +894,18 @@ async def run_ingest_transcribe(
     }
 
 
+def _normalize_ass_color(value: Any, default: str = "&H3D8AFF&") -> str:
+    """Normalize RGB hex (#RRGGBB) or ASS BGR (&HBBGGRR&) color strings to ASS BGR format."""
+    s = str(value or "").strip()
+    if re.fullmatch(r"&H[0-9A-Fa-f]{6}&?", s):
+        return s if s.endswith("&") else f"{s}&"
+    m = re.fullmatch(r"#([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})", s)
+    if m:
+        r, g, b = m.group(1), m.group(2), m.group(3)
+        return f"&H{b.upper()}{g.upper()}{r.upper()}&"
+    return default
+
+
 async def run_build_and_qa(
     job_dir: Path,
     preset: dict[str, Any],
@@ -888,27 +917,55 @@ async def run_build_and_qa(
     work_dir = job_dir / "work"
     src_dir = work_dir / "src"
 
-    # Write config.json
-    config_data = {
-        "src": str(src_dir / "%s.mp4"),
-        "highlight": preset.get("highlight_colors", {"pink": "&HA04FFF&", "blue": "&HFF6B3D&"}),
-        "names": {"christian": "Christian"},
-        "zoom": preset.get("zoom", 1.08),
-        "gamma": preset.get("gamma", 1.08),
-    }
-    (work_dir / "config.json").write_text(json.dumps(config_data, indent=2))
-
-    # Validate and write edl.json
-    words_data = {}
+    words_data: dict[str, Any] = {}
     if (work_dir / "words.json").exists():
         words_data = json.loads((work_dir / "words.json").read_text())
 
-    if edl:
+    edl_file = work_dir / "edl.json"
+    if edl is not None:
         fixed_edl = validate_and_fix_edl_overlaps(edl, words_data)
-        (work_dir / "edl.json").write_text(json.dumps(fixed_edl, indent=2))
-
-    if not (work_dir / "edl.json").exists():
+        edl_file.write_text(json.dumps(fixed_edl, indent=2))
+    elif edl_file.exists():
+        raw_disk_edl = json.loads(edl_file.read_text())
+        fixed_edl = validate_and_fix_edl_overlaps(raw_disk_edl, words_data)
+        edl_file.write_text(json.dumps(fixed_edl, indent=2))
+    else:
         raise FileNotFoundError("edl.json missing in workdir.")
+
+    # Merge EDL keyword highlights, name normalizations, and ingest luma gamma into config.json
+    merged_highlight: dict[str, str] = {
+        str(k).lower(): _normalize_ass_color(v)
+        for k, v in (preset.get("highlight_colors") or {"pink": "&HA04FFF&", "blue": "&HFF6B3D&"}).items()
+        if str(k).strip()
+    }
+    for k, v in (fixed_edl.get("highlight") or {}).items():
+        clean_k = re.sub(r"[^a-z0-9']", "", str(k).lower())
+        if clean_k:
+            merged_highlight[clean_k] = _normalize_ass_color(v)
+
+    merged_names: dict[str, str] = {"christian": "Christian"}
+    for k, v in (fixed_edl.get("names") or {}).items():
+        if str(k).strip() and str(v).strip():
+            merged_names[str(k).strip().lower()] = str(v).strip()
+
+    gamma_val = float(preset.get("gamma", 1.08))
+    ingest_meta_file = work_dir / "ingest_meta.json"
+    if ingest_meta_file.exists():
+        try:
+            meta_json = json.loads(ingest_meta_file.read_text())
+            if meta_json.get("suggested_gamma"):
+                gamma_val = float(meta_json["suggested_gamma"])
+        except Exception:
+            pass
+
+    config_data = {
+        "src": str(src_dir / "%s.mp4"),
+        "highlight": merged_highlight,
+        "names": merged_names,
+        "zoom": preset.get("zoom", 1.08),
+        "gamma": round(gamma_val, 3),
+    }
+    (work_dir / "config.json").write_text(json.dumps(config_data, indent=2))
 
     is_vertical = preset.get("width", 1080) == 1080 and preset.get("height", 1920) == 1920
 
@@ -916,7 +973,6 @@ async def run_build_and_qa(
         log_cb("[BUILD] Executing base cut build...")
 
     if is_vertical:
-        # Step 1: Initial build
         build_cmd = [
             UV_BIN,
             "run",
@@ -933,7 +989,6 @@ async def run_build_and_qa(
         if code != 0:
             raise RuntimeError(f"build.py failed: {err}\n{out}")
 
-        # Step 2: QA Gate
         if log_cb:
             log_cb("[QA] Running audio burst and clipping analysis...")
         qa_cmd = [
@@ -951,7 +1006,6 @@ async def run_build_and_qa(
         ]
         code, qa_out, _ = await _run_proc(qa_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
 
-        # Step 3: Stutters / Disfluency detection
         if log_cb:
             log_cb("[STUTTERS] Detecting immediate word repeats and fillers...")
         stutters_cmd = [
@@ -968,7 +1022,6 @@ async def run_build_and_qa(
         ]
         await _run_proc(stutters_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
 
-        # Check cuts_proposed.json
         cuts_proposed_file = work_dir / "cuts_proposed.json"
         if cuts_proposed_file.exists():
             try:
@@ -978,18 +1031,22 @@ async def run_build_and_qa(
                     if log_cb:
                         log_cb(f"[STUTTERS] Applying {total_proposed} proposed stutter cuts and rebuilding...")
                     (work_dir / "cuts.json").write_text(json.dumps(cuts_data, indent=2))
-                    await _run_proc(build_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
+                    rcode, rout, rerr = await _run_proc(build_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
+                    if rcode != 0:
+                        raise RuntimeError(f"Post-stutter build.py rebuild failed: {rerr}\n{rout}")
+                    # Refresh QA on the newly rebuilt base.mp4 so bursts/qa logs match actual output
+                    _, qa_out, _ = await _run_proc(qa_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
+            except RuntimeError:
+                raise
             except Exception:
                 pass
 
-        # Step 4: Final transcript VAD generation
-        base16_wav = work_dir / "base16.wav"
-        if not base16_wav.exists():
-            await _run_proc(
-                [FFMPEG_BIN, "-y", "-i", "base.mp4", "-vn", "-ac", "1", "-ar", "16000", "base16.wav"],
-                cwd=work_dir,
-                cancel_event=cancel_event,
-            )
+        # Always re-extract base16.wav from the final base.mp4 (never reuse stale pre-rebuild base16.wav)
+        await _run_proc(
+            [FFMPEG_BIN, "-v", "error", "-y", "-i", "base.mp4", "-vn", "-ac", "1", "-ar", "16000", "base16.wav"],
+            cwd=work_dir,
+            cancel_event=cancel_event,
+        )
 
         vad_script = (
             "import wave,numpy as np\n"
@@ -1006,7 +1063,6 @@ async def run_build_and_qa(
             cancel_event=cancel_event,
         )
 
-        # Step 5: Scriptdiff
         diff_cmd = [
             "python3",
             "-I",
@@ -1233,6 +1289,46 @@ async def run_bgm_and_broll(
     }
 
 
+def _read_ass_cues_summary(cap_ass: Path) -> str:
+    """Extract clean readable timestamped subtitle lines from cap.ass for graphics sync."""
+    if not cap_ass.exists():
+        return ""
+    lines: list[str] = []
+    for raw in cap_ass.read_text(errors="replace").splitlines():
+        if not raw.startswith("Dialogue:"):
+            continue
+        parts = raw.split(",", 9)
+        if len(parts) < 10:
+            continue
+        start_s, end_s, text_raw = parts[1].strip(), parts[2].strip(), parts[9]
+        clean = re.sub(r"\{[^}]*\}", "", text_raw).strip()
+        if clean:
+            lines.append(f"[{start_s} -> {end_s}] {clean}")
+    return "\n".join(lines[:45])
+
+
+def _extract_check_issues(check_out: str) -> tuple[bool, list[str]]:
+    """Inspect hyperframes check JSON stdout for hard errors, empty stage, or static seek."""
+    issues: list[str] = []
+    try:
+        idx = check_out.find("{")
+        if idx == -1:
+            return False, []
+        data = json.loads(check_out[idx:])
+        for section in ("lint", "runtime", "layout", "craft"):
+            sec = data.get(section, {})
+            if sec.get("errorCount", 0) > 0:
+                for f in sec.get("findings", []):
+                    issues.append(f"{section}: {f.get('code')} - {f.get('message')}")
+            elif section in ("layout", "craft"):
+                for f in sec.get("findings", []):
+                    if f.get("code") in ("sweep_static", "first_frame_empty"):
+                        issues.append(f"{section}: {f.get('code')} - {f.get('message')}")
+        return len(issues) > 0, issues
+    except Exception:
+        return False, []
+
+
 async def run_motion_graphics(
     job_dir: Path,
     preset: dict[str, Any],
@@ -1242,7 +1338,7 @@ async def run_motion_graphics(
     cancel_event: asyncio.Event | None = None,
     log_cb: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Stage 6: Generate HyperFrames composition (GSAP + SVG sketch), check DOM, snapshot, critique, and render overlay.mov."""
+    """Stage 6: Generate scaffolded HyperFrames composition (GSAP + SVG sketch), check DOM, snapshot, enforce Vision critique, and render overlay.mov."""
     work_dir = job_dir / "work"
     hf_dir = job_dir / "hf"
     assets_dir = hf_dir / "assets"
@@ -1256,7 +1352,6 @@ async def run_motion_graphics(
     for f in (v6_hf_assets / "fonts").glob("*.woff2"):
         shutil.copy2(f, fonts_dir / f.name)
 
-    # Write hyperframes.json
     hf_config = {
         "$schema": "https://hyperframes.heygen.com/schema/hyperframes.json",
         "registry": "https://raw.githubusercontent.com/heygen-com/hyperframes/main/registry",
@@ -1270,7 +1365,6 @@ async def run_motion_graphics(
     }
     (hf_dir / "hyperframes.json").write_text(json.dumps(hf_config, indent=2))
 
-    # Write package.json
     pkg_json = {
         "name": "hf",
         "private": True,
@@ -1283,72 +1377,58 @@ async def run_motion_graphics(
     }
     (hf_dir / "package.json").write_text(json.dumps(pkg_json, indent=2))
 
-    # Load timeline data
+    cues_mjs_code = (
+        "import fs from 'fs';\n"
+        "const c = JSON.parse(fs.readFileSync('cues.json', 'utf8'));\n"
+        "fs.writeFileSync('cues.js', 'window.CUES=' + JSON.stringify(c) + ';\\n');\n"
+        "const h = fs.readFileSync('index.html', 'utf8').replace(/data-duration=\"[^\"]*\"/, `data-duration=\"${c.total}\"`);\n"
+        "fs.writeFileSync('index.html', h);\n"
+    )
+    (hf_dir / "cues.mjs").write_text(cues_mjs_code)
+
     timeline_file = work_dir / "timeline.json"
     timeline_data = json.loads(timeline_file.read_text()) if timeline_file.exists() else {"total": 60.0, "parts": []}
     edl_file = work_dir / "edl.json"
     edl_data = json.loads(edl_file.read_text()) if edl_file.exists() else {"parts": []}
+    total_dur = float(timeline_data.get("total", 60.0) or 60.0)
+    word_cues_text = _read_ass_cues_summary(work_dir / "cap.ass")
 
-    # Generate or assemble composition code
-    prompt = build_hyperframes_prompt(timeline_data, edl_data, preset)
+    def _write_scene_files(cues_obj: dict[str, Any], scenes_code: str):
+        cues_norm = dict(cues_obj or {})
+        cues_norm.setdefault("total", round(total_dur, 2))
+        (hf_dir / "cues.json").write_text(json.dumps(cues_norm, indent=2))
+        (hf_dir / "index.html").write_text(render_hyperframes_index_html(preset, scenes_code, total_dur))
+
+    # Generate lightweight cues_json + scenes_js against scaffolded chalk APIs
+    cues_data: dict[str, Any] = {}
+    scenes_js = ""
+    prompt = build_hyperframes_prompt(timeline_data, edl_data, preset, word_cues_text=word_cues_text)
     try:
         if log_cb:
-            log_cb(f"[GRAPHICS] Generating HyperFrames composition via AGY ({creative_model})...")
+            log_cb(f"[GRAPHICS] Generating HyperFrames beat scenes via AGY ({creative_model})...")
         comp_data = await run_agy_json(
             prompt,
-            schema=HYPERFRAMES_SCHEMA,
+            schema=HYPERFRAMES_SCENE_SCHEMA,
             model=creative_model,
-            timeout_s=600.0,
+            cwd=hf_dir,
+            add_dirs=[hf_dir],
+            timeout_s=360.0,
             cancel_event=cancel_event,
             log_cb=log_cb,
         )
-        (hf_dir / "index.html").write_text(comp_data["index_html"])
-        (hf_dir / "cues.json").write_text(json.dumps(comp_data["cues_json"], indent=2))
-        (hf_dir / "cues.mjs").write_text(comp_data["cues_mjs"])
+        cues_data = comp_data.get("cues_json") or {}
+        scenes_js = str(comp_data.get("scenes_js") or "").strip()
+        if not scenes_js:
+            raise ValueError("AGY returned empty scenes_js")
     except Exception as e:
         if log_cb:
-            log_cb(f"[WARN] HyperFrames generation failed, falling back to structured template: {e}")
-        # Robust fallback composition
-        total = timeline_data.get("total", 60.0)
-        cues_data = {"total": total, "hook": 0.5, "climax": total * 0.75}
-        (hf_dir / "cues.json").write_text(json.dumps(cues_data, indent=2))
-        cues_mjs_code = (
-            "import fs from 'fs';\n"
-            "const c = JSON.parse(fs.readFileSync('cues.json', 'utf8'));\n"
-            "fs.writeFileSync('cues.js', 'window.CUES=' + JSON.stringify(c) + ';\\n');\n"
-            "const h = fs.readFileSync('index.html', 'utf8').replace(/data-duration=\"[^\"]*\"/, `data-duration=\"${c.total}\"`);\n"
-            "fs.writeFileSync('index.html', h);\n"
-        )
-        (hf_dir / "cues.mjs").write_text(cues_mjs_code)
+            log_cb(f"[WARN] HyperFrames scene generation failed ({e}); building deterministic animated chalk fallback.")
+        cues_data, scenes_js = build_fallback_scenes_js(timeline_data, edl_data, preset)
 
-        g_top = preset.get("graphics_band", {}).get("top", 1140)
-        g_bot = preset.get("graphics_band", {}).get("bottom", 1500)
-        index_html_code = f"""<!doctype html><html lang="en"><head><meta charset="UTF-8"/>
-<meta name="viewport" content="width={preset.get('width', 1080)}, height={preset.get('height', 1920)}"/>
-<script src="assets/gsap.min.js"></script><script src="cues.js"></script>
-<style>
-@font-face{{font-family:'Marker';src:url('assets/fonts/PermanentMarker.woff2') format('woff2')}}
-@font-face{{font-family:'Caveat';font-weight:700;src:url('assets/fonts/Caveat-700.woff2') format('woff2')}}
-*{{margin:0;padding:0;box-sizing:border-box}}
-html,body{{margin:0;width:{preset.get('width', 1080)}px;height:{preset.get('height', 1920)}px;overflow:hidden;background:transparent}}
-#root{{position:absolute;inset:0}}
-#stage{{position:absolute;inset:0;clip-path:inset({g_top}px 0 {preset.get('height', 1920) - g_bot}px 0)}}
-.g{{position:absolute;left:0;top:0;width:100%;height:100%;opacity:0}}
-.ln{{fill:none;stroke-linecap:round;stroke-linejoin:round}}
-</style></head><body>
-<div id="root" data-composition-id="main" data-start="0" data-duration="{total}" data-width="{preset.get('width', 1080)}" data-height="{preset.get('height', 1920)}" data-fps="30">
-<div id="stage"></div></div>
-<script>
-const C=window.CUES;
-const tl=gsap.timeline({{paused:true}});
-window.__timelines=window.__timelines||{{}};window.__timelines["main"]=tl;
-</script></body></html>"""
-        (hf_dir / "index.html").write_text(index_html_code)
+    _write_scene_files(cues_data, scenes_js)
 
-    # Sync cues
+    # Sync cues and check composition
     await _run_proc(["node", "cues.mjs"], cwd=hf_dir, cancel_event=cancel_event)
-
-    # Check composition with HyperFrames CLI
     if log_cb:
         log_cb("[GRAPHICS] Validating composition with hyperframes check...")
     check_code, check_out, _ = await _run_proc(
@@ -1357,24 +1437,9 @@ window.__timelines=window.__timelines||{{}};window.__timelines["main"]=tl;
         cancel_event=cancel_event,
         log_cb=log_cb,
     )
-    if check_code != 0:
-        if log_cb:
-            log_cb(f"[GRAPHICS] Attempting auto-repair on HyperFrames syntax via AGY ({mechanical_model})...")
-        repair_prompt = f"Fix the following HyperFrames syntax/DOM errors in index.html:\n{check_out}\n\nCurrent index.html:\n{(hf_dir / 'index.html').read_text()[:4000]}"
-        try:
-            repaired = await run_agy_json(
-                repair_prompt,
-                schema=HYPERFRAMES_SCHEMA,
-                model=mechanical_model,
-                cancel_event=cancel_event,
-                log_cb=log_cb,
-            )
-            (hf_dir / "index.html").write_text(repaired["index_html"])
-            await _run_proc(["node", "cues.mjs"], cwd=hf_dir, cancel_event=cancel_event)
-        except Exception:
-            pass
+    has_check_issues, check_issues = _extract_check_issues(check_out)
 
-    # Capture snapshots for critique
+    # Capture snapshots for Art Director critique
     snapshots_dir = hf_dir / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
     if log_cb:
@@ -1385,18 +1450,83 @@ window.__timelines=window.__timelines||{{}};window.__timelines["main"]=tl;
         cancel_event=cancel_event,
     )
 
-    # AGY Vision Art Director Critique
+    critique_res: dict[str, Any] = {"passes": True, "critique": "", "issues": [], "fixes_needed": []}
     try:
         critique_prompt = build_vision_critique_prompt(str(snapshots_dir), str(hf_dir / "cues.json"), preset)
-        await run_agy_json(
+        critique_res = await run_agy_json(
             critique_prompt,
             schema=VISION_CRITIQUE_SCHEMA,
             model=vision_model,
+            cwd=job_dir,
+            add_dirs=[snapshots_dir, hf_dir],
             cancel_event=cancel_event,
             log_cb=log_cb,
         )
-    except Exception:
-        pass
+    except Exception as ce:
+        if log_cb:
+            log_cb(f"[GRAPHICS] Vision critique skipped/failed: {ce}")
+
+    # Enforce Vision QA & check findings with targeted revision pass
+    needs_revision = (
+        check_code != 0
+        or has_check_issues
+        or (isinstance(critique_res, dict) and critique_res.get("passes") is False)
+    )
+    if needs_revision:
+        combined_issues = list(check_issues) + list(critique_res.get("issues", []))
+        fixes_needed = list(critique_res.get("fixes_needed", []))
+        if log_cb:
+            log_cb(f"[GRAPHICS] Critique/check flagged {len(combined_issues)} issues — running targeted revision via AGY ({creative_model})...")
+        try:
+            rev_prompt = build_hyperframes_revision_prompt(
+                issues=combined_issues or ["Static/blank frame or layout warning"],
+                fixes_needed=fixes_needed or ["Ensure visible animated chalk SVG props at t=0 and clean out() transitions"],
+                cues_json=cues_data,
+                scenes_js=scenes_js,
+                timeline_json=timeline_data,
+                edl_json=edl_data,
+                preset=preset,
+            )
+            rev_data = await run_agy_json(
+                rev_prompt,
+                schema=HYPERFRAMES_SCENE_SCHEMA,
+                model=creative_model,
+                cwd=hf_dir,
+                add_dirs=[hf_dir],
+                timeout_s=300.0,
+                cancel_event=cancel_event,
+                log_cb=log_cb,
+            )
+            rev_js = str(rev_data.get("scenes_js") or "").strip()
+            if rev_js:
+                cues_data = rev_data.get("cues_json") or cues_data
+                scenes_js = rev_js
+                _write_scene_files(cues_data, scenes_js)
+                await _run_proc(["node", "cues.mjs"], cwd=hf_dir, cancel_event=cancel_event)
+                check_code2, check_out2, _ = await _run_proc(
+                    [HYPERFRAMES_BIN, "check", "hf", "--json"],
+                    cwd=job_dir,
+                    cancel_event=cancel_event,
+                    log_cb=log_cb,
+                )
+                still_bad, _ = _extract_check_issues(check_out2)
+                if check_code2 != 0 or still_bad:
+                    if log_cb:
+                        log_cb("[WARN] Revised scenes still flagged DOM/static errors — applying deterministic animated fallback.")
+                    cues_data, scenes_js = build_fallback_scenes_js(timeline_data, edl_data, preset)
+                    _write_scene_files(cues_data, scenes_js)
+                    await _run_proc(["node", "cues.mjs"], cwd=hf_dir, cancel_event=cancel_event)
+                await _run_proc(
+                    [HYPERFRAMES_BIN, "snapshot", "hf", "--no-browser-gpu", "--output", str(snapshots_dir), "--frames", "5"],
+                    cwd=job_dir,
+                    cancel_event=cancel_event,
+                )
+        except Exception as re_err:
+            if log_cb:
+                log_cb(f"[WARN] Revision pass failed ({re_err}); ensuring deterministic non-empty animated fallback.")
+            cues_data, scenes_js = build_fallback_scenes_js(timeline_data, edl_data, preset)
+            _write_scene_files(cues_data, scenes_js)
+            await _run_proc(["node", "cues.mjs"], cwd=hf_dir, cancel_event=cancel_event)
 
     # Render transparent MOV overlay
     overlay_mov = work_dir / "overlay.mov"
@@ -1419,6 +1549,7 @@ window.__timelines=window.__timelines||{{}};window.__timelines["main"]=tl;
     return {
         "overlay_mov": str(overlay_mov),
         "snapshots_dir": str(snapshots_dir),
+        "vision_critique": critique_res,
     }
 
 
@@ -1616,6 +1747,152 @@ async def recomposite_studio(
     )
 
 
+async def _extract_cover_candidates(
+    work_dir: Path,
+    cover_dir: Path,
+    preset: dict[str, Any],
+    cancel_event: asyncio.Event | None = None,
+) -> list[str]:
+    """Extract 8 uncaptioned cover candidate frames from source clips aligned to timeline parts."""
+    src_dir = work_dir / "src"
+    timeline_file = work_dir / "timeline.json"
+    w = int(preset.get("width", 1080))
+    h = int(preset.get("height", 1920))
+    scale_crop = (
+        f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+        f"crop={w}:{h},setsar=1"
+    )
+
+    sample_specs: list[tuple[Path, float]] = []
+    if timeline_file.exists():
+        try:
+            t_data = json.loads(timeline_file.read_text())
+            parts = t_data.get("parts", [])
+            if parts:
+                ratios = [0.06, 0.16, 0.28, 0.40, 0.54, 0.68, 0.80, 0.92]
+                total = float(t_data.get("total", 0.0) or 0.0)
+                for r in ratios:
+                    target_t = total * r if total > 0 else 0.0
+                    chosen = next(
+                        (p for p in parts if float(p.get("start", 0.0)) <= target_t <= float(p.get("end", 0.0))),
+                        parts[min(len(parts) - 1, int(r * len(parts)))],
+                    )
+                    clip_file = src_dir / f"{chosen.get('clip', 'c01')}.mp4"
+                    subs = chosen.get("subs") or []
+                    if clip_file.exists() and subs:
+                        s0, s1, _ = subs[len(subs) // 2]
+                        src_t = (float(s0) + float(s1)) / 2.0
+                        sample_specs.append((clip_file, max(0.0, src_t)))
+                    elif clip_file.exists() and chosen.get("src"):
+                        src_t = (float(chosen["src"][0]) + float(chosen["src"][1])) / 2.0
+                        sample_specs.append((clip_file, max(0.0, src_t)))
+        except Exception:
+            sample_specs = []
+
+    if not sample_specs:
+        base_mp4 = work_dir / "base.mp4"
+        dur = probe_media(base_mp4)["duration_s"]
+        sample_specs = [
+            (base_mp4, dur * r) for r in [0.08, 0.18, 0.28, 0.38, 0.50, 0.65, 0.80, 0.90]
+        ]
+
+    candidate_frames: list[str] = []
+    for idx, (clip_path, ts) in enumerate(sample_specs):
+        if not clip_path.exists():
+            continue
+        frame_path = cover_dir / f"cand_{idx + 1:02d}.png"
+        extract_cmd = [
+            FFMPEG_BIN,
+            "-v",
+            "error",
+            "-y",
+            "-ss",
+            f"{ts:.2f}",
+            "-i",
+            str(clip_path),
+            "-vf",
+            scale_crop,
+            "-vframes",
+            "1",
+            str(frame_path),
+        ]
+        await _run_proc(extract_cmd, cwd=cover_dir, cancel_event=cancel_event)
+        if frame_path.exists() and frame_path.stat().st_size > 0:
+            candidate_frames.append(str(frame_path))
+    return candidate_frames
+
+
+async def _extract_cover_sticker(
+    work_dir: Path,
+    cover_dir: Path,
+    preset: dict[str, Any],
+    cancel_event: asyncio.Event | None = None,
+) -> dict[str, Any] | None:
+    """Sample overlay.mov for a crisp non-transparent graphic sticker bbox within graphics_band."""
+    overlay_mov = work_dir / "overlay.mov"
+    if not overlay_mov.exists():
+        return None
+    dur = probe_media(overlay_mov)["duration_s"]
+    if dur <= 0.2:
+        return None
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    g_band = preset.get("graphics_band", {})
+    g_top = int(g_band.get("top", 1140))
+    g_bot = int(g_band.get("bottom", 1500))
+    best_info: tuple[int, Path, tuple[int, int, int, int]] | None = None
+
+    for idx, ratio in enumerate([0.04, 0.22, 0.45, 0.68, 0.85]):
+        t_pos = min(max(0.0, dur * ratio), max(0.0, dur - 0.1))
+        tmp_png = cover_dir / f"_ov_sample_{idx}.png"
+        await _run_proc(
+            [FFMPEG_BIN, "-v", "error", "-y", "-ss", f"{t_pos:.2f}", "-i", str(overlay_mov), "-vframes", "1", str(tmp_png)],
+            cwd=cover_dir,
+            cancel_event=cancel_event,
+        )
+        if not tmp_png.exists():
+            continue
+        try:
+            with Image.open(tmp_png).convert("RGBA") as img:
+                alpha = img.getchannel("A")
+                # Restrict search to graphics band to avoid picking empty borders
+                cropped_band = alpha.crop((0, max(0, g_top), img.width, min(img.height, g_bot)))
+                bbox = cropped_band.getbbox()
+                if bbox:
+                    full_bbox = (bbox[0], bbox[1] + max(0, g_top), bbox[2], bbox[3] + max(0, g_top))
+                    bw = full_bbox[2] - full_bbox[0]
+                    bh = full_bbox[3] - full_bbox[1]
+                    area = bw * bh
+                    if bw >= 80 and bh >= 40 and (best_info is None or area > best_info[0]):
+                        best_info = (area, tmp_png, full_bbox)
+        except Exception:
+            pass
+
+    if not best_info:
+        for idx in range(5):
+            (cover_dir / f"_ov_sample_{idx}.png").unlink(missing_ok=True)
+        return None
+
+    _, winner_path, bbox = best_info
+    sticker_path = cover_dir / "sticker_src.png"
+    shutil.copy2(winner_path, sticker_path)
+    for idx in range(5):
+        (cover_dir / f"_ov_sample_{idx}.png").unlink(missing_ok=True)
+
+    bw = max(1, bbox[2] - bbox[0])
+    bh = max(1, bbox[3] - bbox[1])
+    target_scale = min(1.35, 760.0 / bw, 280.0 / bh)
+    return {
+        "path": str(sticker_path),
+        "crop": list(bbox),
+        "scale": round(max(0.6, target_scale), 2),
+    }
+
+
 async def run_deliverables(
     job_dir: Path,
     preset: dict[str, Any],
@@ -1624,92 +1901,105 @@ async def run_deliverables(
     cancel_event: asyncio.Event | None = None,
     log_cb: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Stage 8: Extract candidate frames, generate high-CTR thumbnail covers (cover_A & cover_B), and write structured descriptions."""
+    """Stage 8: Extract uncaptioned candidate frames, generate high-CTR thumbnail covers (cover_A & cover_B), and write grounded descriptions."""
     work_dir = job_dir / "work"
     final_dir = job_dir / "final"
     cover_dir = job_dir / "cover"
     cover_dir.mkdir(parents=True, exist_ok=True)
 
-    base_mp4 = work_dir / "base.mp4"
-    probe = probe_media(base_mp4)
-    dur = probe["duration_s"]
+    candidate_frames = await _extract_cover_candidates(work_dir, cover_dir, preset, cancel_event=cancel_event)
 
-    # Extract 8 candidate frames evenly spaced
-    candidate_frames: list[str] = []
-    t_points = [dur * r for r in [0.08, 0.18, 0.28, 0.38, 0.50, 0.65, 0.80, 0.90]]
-
-    for idx, t in enumerate(t_points):
-        frame_name = f"cand_{idx + 1:02d}.png"
-        frame_path = cover_dir / frame_name
-        extract_cmd = [
-            FFMPEG_BIN,
-            "-v",
-            "error",
-            "-y",
-            "-ss",
-            f"{t:.2f}",
-            "-i",
-            str(base_mp4),
-            "-vframes",
-            "1",
-            str(frame_path),
-        ]
-        await _run_proc(extract_cmd, cwd=cover_dir, cancel_event=cancel_event)
-        if frame_path.exists():
-            candidate_frames.append(str(frame_path))
-
-    # Determine cover titles and layout
+    # Determine cover titles, thesis, and creator direction
     edl_file = work_dir / "edl.json"
-    title_text = "WOULD YOU TAKE THE RISK?"
+    selected_script_file = work_dir / "selected_script.json"
+    job_json_file = job_dir / "job.json"
+
+    title_text = "KEY INSIGHT"
+    script_text = ""
+    thesis_text = ""
+    story_prompt = ""
+
     if edl_file.exists():
         try:
-            title_text = json.loads(edl_file.read_text()).get("title", title_text)
+            title_text = json.loads(edl_file.read_text()).get("title") or title_text
+        except Exception:
+            pass
+    if selected_script_file.exists():
+        try:
+            sel_s = json.loads(selected_script_file.read_text())
+            script_text = str(sel_s.get("script_text") or "").strip()
+            thesis_text = str(sel_s.get("thesis") or "").strip()
+            if sel_s.get("title"):
+                title_text = sel_s["title"]
+        except Exception:
+            pass
+    if job_json_file.exists():
+        try:
+            j_data = json.loads(job_json_file.read_text())
+            story_prompt = str(j_data.get("story_prompt") or j_data.get("config", {}).get("story_prompt") or "").strip()
         except Exception:
             pass
 
     is_landscape = preset.get("width", 1080) > preset.get("height", 1920) or preset.get("aspect_ratio") == "16:9"
 
     if is_landscape:
-        # Generate 1920x1080 landscape covers directly using compact Pillow helper
         frame_a = candidate_frames[0] if candidate_frames else None
         frame_b = candidate_frames[1] if len(candidate_frames) > 1 else frame_a
         _generate_landscape_cover(frame_a, cover_dir / "cover_A", title_text)
-        _generate_landscape_cover(frame_b, cover_dir / "cover_B", f"WHY NOBODY TALKS ABOUT {title_text}")
+        _generate_landscape_cover(frame_b, cover_dir / "cover_B", f"WHY {title_text}")
     else:
-        # AGY Cover selection for vertical
+        sticker_cfg = await _extract_cover_sticker(work_dir, cover_dir, preset, cancel_event=cancel_event)
         try:
-            cover_prompt = build_cover_prompt(candidate_frames, [title_text], preset)
+            cover_prompt = build_cover_prompt(
+                candidate_frames,
+                [title_text] + ([thesis_text] if thesis_text else []),
+                preset,
+                has_sticker=bool(sticker_cfg),
+            )
             sel_cover = await run_agy_json(
                 cover_prompt,
                 schema=COVER_SELECTOR_SCHEMA,
                 model=vision_model,
+                cwd=cover_dir,
+                add_dirs=[cover_dir],
                 cancel_event=cancel_event,
             )
         except Exception:
+            words_t = title_text.upper().split()
+            row1 = " ".join(words_t[:2]) if words_t else "WAIT FOR"
+            row2 = " ".join(words_t[2:4]) if len(words_t) > 2 else "THE"
+            row3 = " ".join(words_t[4:6]) if len(words_t) > 4 else "TURN"
+            rows = [[[row1, "w"]], [[row2, "w"]], [[row3, "p"]]] if row3 else [[[row1, "w"]], [[row2, "p"]]]
             sel_cover = {
                 "cover_A": {
                     "frame": candidate_frames[0] if candidate_frames else "",
                     "layout": "A",
-                    "title": [[["LOOK AT", "w"]], [["THIS", "p"]], [["CLOSELY", "w"]]],
+                    "title": rows,
                 },
                 "cover_B": {
-                    "frame": candidate_frames[1] if len(candidate_frames) > 1 else "",
+                    "frame": candidate_frames[min(3, len(candidate_frames) - 1)] if candidate_frames else "",
                     "layout": "B",
-                    "title": [[["WHY NOBODY", "w"]], [["TALKS ABOUT", "w"]], [["THIS", "p"]]],
+                    "title": rows,
                 },
             }
 
-        # Generate covers using cover.py
         for c_id, c_data in [("cover_A", sel_cover["cover_A"]), ("cover_B", sel_cover["cover_B"])]:
             cfg_path = cover_dir / f"{c_id}_config.json"
-            cfg_content = {
-                "frame": c_data.get("frame", candidate_frames[0] if candidate_frames else ""),
+            layout = c_data.get("layout", "A" if c_id == "cover_A" else "B")
+            chosen_frame = c_data.get("frame", "")
+            if not Path(chosen_frame).exists() and candidate_frames:
+                chosen_frame = candidate_frames[0]
+            cfg_content: dict[str, Any] = {
+                "frame": chosen_frame,
                 "out": str(cover_dir / c_id),
-                "layout": c_data.get("layout", "A"),
-                "title": c_data.get("title", [[["TITLE", "w"]]]),
+                "layout": layout,
+                "title": c_data.get("title", [[[title_text.upper(), "w"]]]),
                 "colors": {"w": [255, 255, 255], "p": [255, 79, 160], "b": [61, 107, 255]},
-                "sizes": [118, 118, 140],
+                "sizes": [104, 104, 124] if layout == "A" else [96, 96, 112],
+                "title_y": 185 if layout == "A" else 1200,
             }
+            if sticker_cfg:
+                cfg_content["sticker"] = sticker_cfg
             cfg_path.write_text(json.dumps(cfg_content, indent=2))
             cover_cmd = [
                 UV_BIN,
@@ -1725,15 +2015,16 @@ async def run_deliverables(
             ]
             await _run_proc(cover_cmd, cwd=cover_dir, cancel_event=cancel_event, log_cb=log_cb)
 
-    # Generate Descriptions with AGY via structured JSON schema
+    # Generate Descriptions with AGY strictly grounded in transcript & script
     final_transcript = ""
     if (work_dir / "final_transcript.txt").exists():
         final_transcript = (work_dir / "final_transcript.txt").read_text()
 
     desc_prompt = build_descriptions_prompt(
         final_transcript=final_transcript,
-        script_text=title_text,
-        summary=f"Short-form piece on: {title_text}",
+        script_text=script_text or title_text,
+        summary=f"{title_text}: {thesis_text}" if thesis_text else title_text,
+        story_prompt=story_prompt,
     )
     if log_cb:
         log_cb(f"[DELIVERABLES] Drafting structured descriptions with AGY ({mechanical_model})...")
@@ -1751,12 +2042,12 @@ async def run_deliverables(
         if log_cb:
             log_cb(f"[DELIVERABLES] AGY structured descriptions fallback: {e}")
         desc_data = {
-            "hook": f"Would you take the risk? Here is what happens when you commit to {title_text}.\n\n#burstyourbubble #CreatorEconomy",
-            "teaser": f"The hidden mechanism behind {title_text} that almost everyone misses.\n\nWatch till the end.",
-            "confessional": f"I used to believe the opposite about {title_text}. Here is what changed after analyzing the data.",
-            "debate": f"Is this actually sustainable, or just a temporary loophole? Let me know in the comments.",
-            "minimal": f"The breakdown on {title_text}.\n\nSave this for your next video.",
-            "recommendation": "Option 1 (Hook) is recommended for highest open-rate on algorithmic feeds.",
+            "hook": f"{title_text} — did you catch that twist?",
+            "teaser": f"What nobody tells you about {title_text.lower()}.",
+            "confessional": f"Breaking down why {title_text.lower()} actually matters.",
+            "debate": f"Where do you stand on {title_text.lower()}? Drop your take below.",
+            "minimal": f"{title_text}.",
+            "recommendation": "Option 1 (Hook) leads with curiosity for feed retention.",
         }
 
     # Save structured descriptions.json

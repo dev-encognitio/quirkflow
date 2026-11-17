@@ -150,6 +150,15 @@ HYPERFRAMES_SCHEMA: dict[str, Any] = {
     "required": ["index_html", "cues_json", "cues_mjs"],
 }
 
+HYPERFRAMES_SCENE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "cues_json": {"type": "object"},
+        "scenes_js": {"type": "string"},
+    },
+    "required": ["cues_json", "scenes_js"],
+}
+
 AUDIO_SPOTCHECK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -479,6 +488,7 @@ def build_script_generation_prompt(
     guide_summary: str | None = None,
     preset: dict[str, Any] | None = None,
     story_prompt: str = "",
+    clip_summary: str = "",
 ) -> str:
     """Build the prompt for generating 3 distinct script concepts (A/B/C)."""
     p = preset or {}
@@ -497,19 +507,30 @@ def build_script_generation_prompt(
     if story_prompt and story_prompt.strip():
         user_story_block = f"\nCREATOR'S STORY DIRECTION & FOCUS:\n{story_prompt.strip()}\n"
 
-    return f"""You are an elite short-form video editor and retention specialist producing a high-performing video ({aspect}, {w}x{h}).
+    clip_block = f"\nSOURCE CLIPS METADATA:\n{clip_summary}\n" if clip_summary else ""
+
+    return f"""Do NOT read external files or run shell commands. Work strictly from the provided text and output valid JSON only.
+
+You are an elite short-form video editor and retention specialist producing a high-performing video ({aspect}, {w}x{h}).
 
 TASK:
-Review the following complete transcript of raw recording clips. Formulate exactly THREE distinct, compelling script options (Option A, Option B, Option C).
-Each script must be constructed entirely from spoken ideas and quotes present in the raw footage.
-{user_story_block}
+Review the complete transcript of raw recording clips below. Formulate THREE distinct, compelling script options (Option A, Option B, Option C).
+{user_story_block}{clip_block}
 RAW TRANSCRIPT:
 ```
-{transcript_text}
+{transcript_text[:36000]}
 ```
 
+COHERENCE & GROUNDING RULES (NON-NEGOTIABLE):
+1. Construct EVERY line from actual spoken clauses and sentences present in the raw transcript — never invent transitions or words the speaker never said!
+2. Prefer contiguous multi-sentence takes and complete clauses with natural grammatical lead-ins. NEVER plan rapid 1-second Frankencut stitches of unrelated noun phrases or dangling fragments.
+3. Read each assembled `script_text` aloud mentally: every transition between sentences must sound like continuous, grammatical speech from one human thought to the next.
+4. Respect hypotheticals: if the speaker describes a hypothetical example, keep that hypothetical framing intact — never present a thought experiment as a factual personal claim.
+5. Exclude filler rambling, coughs, throat-clears, profanity, or meta comments ("sorry it's noisy").
+6. Avoid mixing visually mismatched clips mid-thought when a single cohesive take covers the idea.
+
 RETENTION DIRECTIVES (GUIDE.md):
-{guide_block}
+{guide_block[:4000]}
 
 REQUIREMENTS FOR EACH OPTION:
 1. id: "A", "B", or "C".
@@ -518,8 +539,8 @@ REQUIREMENTS FOR EACH OPTION:
 4. viewer_question: The curiosity or skepticism the hook activates.
 5. turn: The surprising twist, counter-intuitive insight, or revelation.
 6. loop: How the ending phrase seamlessly connects back to the hook or re-contextualizes it.
-7. estimated_duration_s: Estimated duration between 40s and 120s.
-8. script_text: The complete, punchy narration text assembled for the spoken edit.
+7. estimated_duration_s: Realistic spoken duration (typically 40s-120s matching selected clauses).
+8. script_text: Complete spoken edit built cleanly from grounded clauses in the transcript.
 9. parts_hint: List of logical beat titles or parts.
 
 Return valid JSON conforming to the schema. Output JSON only."""
@@ -532,26 +553,28 @@ def build_script_critic_prompt(
 ) -> str:
     """Build the prompt for the adversarial cold-viewer critic pass."""
     options_json = json.dumps(script_options, indent=2)
-    return f"""You are an adversarial short-form video viewer and algorithmic retention auditor.
+    return f"""Do NOT read external files or run shell commands. Work strictly from the provided text and output valid JSON only.
+
+You are an adversarial short-form video viewer and algorithmic retention auditor.
 You scroll TikTok, Reels, and YouTube Shorts with zero patience. You skip immediately if:
 - The first 2 seconds contain throat clearing, preamble, or generic statements.
-- The hook fails the Sound-Off Test (cannot be understood on mute).
-- The speaker meanders, repeats themselves, or makes unearned conclusions.
-- The ending fizzles out with a generic 'follow for more'.
+- Lines read like choppy stitched fragments, broken grammar, or missing clause lead-ins.
+- Words in `script_text` were invented and do NOT appear verbatim inside ORIGINAL SOURCE TRANSCRIPT.
+- The ending fizzles out instead of delivering a clear turn and loop.
 
 SCRIPTS UNDER REVIEW:
 {options_json}
 
 ORIGINAL SOURCE TRANSCRIPT:
 ```
-{transcript_text[:3000]}
+{transcript_text[:36000]}
 ```
 
 AUDIT INSTRUCTIONS:
-1. Evaluate each option with brutal honesty.
-2. If ANY option contains throat-clearing, filler, or a slow hook, identify the exact flaw in 'issues'.
-3. In 'revised_options', output the tightened, perfected versions of all 3 options with filler trimmed and the Triple Hook reinforced.
-4. Set 'passes' to true only if all revised scripts meet outlier retention standards.
+1. Check every option for spoken coherence (read `script_text` aloud sentence-by-sentence) AND verify phrases exist in ORIGINAL SOURCE TRANSCRIPT.
+2. Identify weak hooks, broken transitions, dangling pronouns, or ungrounded wording in 'issues'.
+3. In 'revised_options', output perfected, tightened, 100% transcript-grounded versions of all 3 options with clean clause transitions and strong Triple Hooks.
+4. Set 'passes' to true only if all revised scripts read like fluent, natural speech with high retention hooks.
 
 Return valid JSON conforming to the critic schema. Output JSON only."""
 
@@ -561,92 +584,323 @@ def build_edl_prompt(
     words_json_summary: str,
     transcript_text: str,
     preset: dict[str, Any] | None = None,
+    clip_summary: str = "",
 ) -> str:
     """Build the prompt for generating the Edit Decision List (EDL) and config."""
     script_str = json.dumps(selected_script, indent=2)
-    return f"""You are a precision video assembly engineer. Build an exact Edit Decision List (edl.json) matching the approved script.
+    clip_block = f"\nSOURCE CLIP INFO:\n{clip_summary}\n" if clip_summary else ""
+    return f"""Do NOT read external files or run shell commands. Work strictly from the provided inputs and output valid JSON only.
+
+You are a precision video assembly engineer. Build an exact Edit Decision List (edl.json) matching the approved script.
 
 APPROVED SCRIPT:
 {script_str}
-
+{clip_block}
 CLIP TRANSCRIPTS & WORD TIMESTAMPS:
 ```
 {words_json_summary}
 ```
 
 EDL REQUIREMENTS:
-1. 'title': Catchy title for config.
-2. 'highlight': Dict mapping keywords to ASS subtitle colors (e.g., '{{"pink": "&HA04FFF&", "blue": "&HFF6B3D&"}}').
-3. 'names': Dict of misheard names to fix (e.g., '{{"christian": "Christian"}}').
-4. 'parts': Array of ordered cut segments:
-   - 'id': Segment identifier (e.g., 'p01', 'p02', ...).
-   - 'clip': Source clip id (e.g., 'c01', 'c02').
-   - 'range': [start_seconds, end_seconds] in the source clip.
-   - 'say': Verbatim words spoken during this range.
-   - 'hold': Float seconds to hold video tail before next cut (0.0 to 0.2).
-   - 'beat': Beat type ('hook', 'setup', 'twist', 'climax', 'loop').
-   - 'note': Visual cue or context note.
+1. 'title': Catchy 3-6 word hook title.
+2. 'highlight': Dict mapping 4-6 meaningful lowercase single keywords from 'say' to ASS BGR hex colors (NOTE ASS uses &HBBGGRR& order! E.g. coral/orange='&H3D8AFF&', lime='&H60F5C8&', cyan='&HFFD400&', pink='&HFFA04F&', gold='&H4FD5FF&'). Keys MUST be lowercase stripped words matching captions!
+3. 'names': Dict of lowercase/misheard words or proper nouns to fix in captions (e.g., '{{"christian": "Christian"}}').
+4. 'parts': Ordered cut segments:
+   - 'id': 'p01', 'p02', ...
+   - 'clip': Source clip id ('c01', 'c02', ...).
+   - 'range': [start_seconds, end_seconds] enclosing every spoken word in 'say' from CLIP TRANSCRIPTS.
+   - 'say': EXACT verbatim words spoken in that source range.
+   - 'hold': Float tail hold (0.0 to 0.15).
+   - 'beat': 'hook' | 'setup' | 'twist' | 'climax' | 'loop'.
+   - 'note': Specific visual motion-graphic cue idea for this beat (what hand-drawn SVG diagram/object/text should animate in the safe band!).
 
-CRITICAL RULES:
-- Never cut inside a spoken word.
-- Never let consecutive parts on the same clip overlap in source time.
-- Match verbatim script words closely so word-level captions align cleanly.
+CRITICAL ASSEMBLY & COHERENCE RULES:
+- Prefer longer natural continuous takes (at least 2.5s-15s per part when available; typically 5-12 cohesive parts for ~45-60s) instead of tiny 1s fragments.
+- Every cut transition `p[i].say` -> `p[i+1].say` MUST form fluent, grammatical spoken English when read straight through! Always include clause lead-ins ("because...", "and when...", "so...") inside the part so joins never sound like chopped word salad.
+- Avoid gratuitous clip ping-ponging (e.g., switching c03 <-> c01 every 2 seconds) or jumping to takes with different framing/glasses mid-thought unless starting a deliberate distinct beat.
+- Never let consecutive chronological parts on the same clip overlap in source time.
+- Ensure 'say' matches verbatim words inside 'range' so word-level matching scores >= 0.90.
 
 Return valid JSON conforming to the EDL schema. Output JSON only."""
+
+
+def _extract_hyperframes_beats(
+    timeline_json: dict[str, Any],
+    edl_json: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Merge timeline parts with EDL beat notes and visual cues."""
+    edl_by_id = {str(p.get("id")): p for p in (edl_json or {}).get("parts", []) if p.get("id")}
+    edl_parts = (edl_json or {}).get("parts", [])
+    merged: list[dict[str, Any]] = []
+    for idx, tp in enumerate(timeline_json.get("parts", [])):
+        pid = str(tp.get("id") or f"p{idx + 1:02d}")
+        ep = edl_by_id.get(pid) or (edl_parts[idx] if idx < len(edl_parts) else {})
+        merged.append({
+            "id": pid,
+            "beat": tp.get("beat") or ep.get("beat") or "setup",
+            "start": round(float(tp.get("start", 0.0)), 2),
+            "end": round(float(tp.get("end", 0.0)), 2),
+            "say": str(ep.get("say") or tp.get("say") or "").strip(),
+            "note": str(ep.get("note") or "").strip(),
+        })
+    return merged
+
+
+def render_hyperframes_index_html(
+    preset: dict[str, Any] | None,
+    scenes_js: str,
+    total_dur: float,
+) -> str:
+    """Wrap LLM-generated or fallback GSAP/SVG `scenes_js` in the battle-tested HyperFrames chalk scaffold."""
+    p = preset or {}
+    w = int(p.get("width", 1080))
+    h = int(p.get("height", 1920))
+    fps = int(p.get("fps", 30))
+    g_band = p.get("graphics_band", {})
+    g_top = int(g_band.get("top", 1140 if h >= w else 80))
+    g_bot = int(g_band.get("bottom", 1500 if h >= w else 860))
+    g_left = int(g_band.get("left", 0 if h >= w else 100))
+    g_right = int(g_band.get("right", w if h >= w else w - 100))
+    clip_path = g_band.get("clip_path") or f"inset({g_top}px {max(0, w - g_right)}px {max(0, h - g_bot)}px {g_left}px)"
+
+    title_size = 56 if h >= w else 54
+    cv_size = 50 if h >= w else 46
+    clean_scenes = (scenes_js or "").strip()
+
+    return f"""<!doctype html><html lang="en"><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width={w}, height={h}"/>
+<script src="assets/gsap.min.js"></script><script src="cues.js"></script>
+<style>
+@font-face{{font-family:'Marker';src:url('assets/fonts/PermanentMarker.woff2') format('woff2')}}
+@font-face{{font-family:'Caveat';font-weight:700;src:url('assets/fonts/Caveat-700.woff2') format('woff2')}}
+*{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{margin:0;width:{w}px;height:{h}px;overflow:hidden;background:transparent}}
+#root{{position:absolute;inset:0}}
+#stage{{position:absolute;inset:0;clip-path:{clip_path}}}
+.g{{position:absolute;left:0;top:0;width:{w}px;height:{h}px;opacity:0;filter:drop-shadow(0 3px 0 rgba(0,0,0,.5)) drop-shadow(0 6px 14px rgba(0,0,0,.6))}}
+.g svg{{overflow:visible;display:block}}
+.ln{{fill:none;stroke-linecap:round;stroke-linejoin:round}}
+.hw{{position:absolute;opacity:0;white-space:nowrap;color:#F4EFE6;font:400 {title_size}px/1.1 'Marker',cursive;text-shadow:0 3px 0 rgba(0,0,0,.5),0 6px 16px rgba(0,0,0,.65)}}
+.cv{{font:700 {cv_size}px/1.1 'Caveat',cursive}}
+</style></head><body>
+<div id="root" data-composition-id="main" data-start="0" data-duration="{total_dur:.2f}" data-width="{w}" data-height="{h}" data-fps="{fps}">
+<svg width="0" height="0" style="position:absolute">
+ <defs>
+  <filter id="chalk" x="-20%" y="-20%" width="140%" height="140%"><feTurbulence type="fractalNoise" baseFrequency="0.045" numOctaves="2" seed="3"/><feDisplacementMap in="SourceGraphic" scale="4"/></filter>
+  <filter id="wob" x="-20%" y="-20%" width="140%" height="140%"><feTurbulence type="fractalNoise" baseFrequency="0.022" numOctaves="2" seed="11"/><feDisplacementMap in="SourceGraphic" scale="9"/></filter>
+ </defs>
+</svg>
+<div id="stage"></div>
+</div>
+<script>
+const C=window.CUES||{{}};
+const W="#F4EFE6",L="#C8F560",T="#FF8A3D";
+const stage=document.getElementById("stage");
+const add=h=>stage.insertAdjacentHTML("beforeend",h);
+let MK=0;
+const pl=(d,w,c)=>`<path class="ln" d="${{d}}" stroke="${{c||W}}" stroke-width="${{w}}" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"/>`+
+ `<path class="ln" d="${{d}}" stroke="${{c||W}}" stroke-width="${{(w*.45).toFixed(1)}}" opacity=".55" transform="translate(1.6,-1.4)" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"/>`;
+const dl=(d,w,c)=>{{const id="mk"+(MK++);return `<mask id="${{id}}" maskUnits="userSpaceOnUse" x="-3000" y="-3000" width="7000" height="7000"><path class="mk ln" d="${{d}}" stroke="#fff" stroke-width="40" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"/></mask>`+
+ `<path class="ln" d="${{d}}" stroke="${{c||L}}" stroke-width="${{w}}" stroke-dasharray="0.1 15" mask="url(#${{id}})"/>`;}};
+function draw(id,inner,filt){{add(`<div id="${{id}}" class="g"><svg width="{w}" height="{h}"><g filter="url(#${{filt||"chalk"}})">${{inner}}</g></svg></div>`);}}
+function label(id,html,x,y,o){{o=o||{{}};add(`<div id="${{id}}" class="hw${{o.cv?" cv":""}}" style="left:${{x}}px;top:${{y}}px;${{o.w?`width:${{o.w}}px;text-align:center;`:""}}font-size:${{o.size||(o.cv?{cv_size}:{title_size})}}px;${{o.col?`color:${{o.col}};`:""}}">${{html}}</div>`);}}
+const G=(x,y,s,inner)=>`<g transform="translate(${{x}},${{y}}) scale(${{s}})">${{inner}}</g>`;
+const tl=gsap.timeline({{paused:true}});
+const X=end=>Math.max(0,end-.28);
+function out(sel,t,dy){{tl.to(sel,{{opacity:0,y:"+="+(dy||12),duration:.26,ease:"power2.in"}},t);}}
+function lin(id,t,dur){{tl.set("#"+id,{{opacity:1}},t);tl.fromTo("#"+id,{{clipPath:"inset(-30% 100% -30% -4%)"}},{{clipPath:"inset(-30% -4% -30% -4%)",duration:dur||.4,ease:"power1.inOut"}},t);}}
+function strokes(id,t,dur,st,ease){{tl.set("#"+id,{{opacity:1}},t);tl.to(`#${{id}} .ln[pathLength]`,{{strokeDashoffset:0,duration:dur||.45,ease:ease||"power2.inOut",stagger:st||0}},t);}}
+function dots(id,t,dur,st){{tl.set("#"+id,{{opacity:1}},t);tl.to(`#${{id}} .mk`,{{strokeDashoffset:0,duration:dur||.6,ease:"power2.inOut",stagger:st||0}},t);}}
+function pop(id,t,o){{tl.set("#"+id,{{opacity:1}},t);tl.set(`#${{id}} .ln[pathLength]`,{{strokeDashoffset:0}},t);tl.fromTo("#"+id,{{scale:1.55,opacity:0,transformOrigin:o||"50% 50%"}},{{scale:1,opacity:1,duration:.3,ease:"power4.in"}},t);}}
+function pulse(sel,o,t,s){{tl.to(sel,{{scale:s||1.08,transformOrigin:o||"50% 50%",duration:.14,ease:"power2.out"}},t);tl.to(sel,{{scale:1,duration:.35,ease:"back.out(3)"}},t+.14);}}
+function shake(sel,t,a,n){{a=a||5;n=n||6;for(let i=0;i<n;i++)tl.to(sel,{{x:"+="+(i%2?-2*a:2*a),duration:.06,ease:"none"}},t+.06*i);tl.to(sel,{{x:"-="+(n%2?2*a:0),duration:.06}},t+.06*n);}}
+function swap(a,b,t){{tl.to("#"+a,{{opacity:0,duration:.15}},t);lin(b,t+.1,.4);}}
+
+{clean_scenes}
+
+window.__timelines=window.__timelines||{{}};
+window.__timelines["main"]=tl;
+</script></body></html>"""
+
+
+def build_fallback_scenes_js(
+    timeline_json: dict[str, Any],
+    edl_json: dict[str, Any],
+    preset: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Build deterministic animated cue-synced chalk graphics fallback so #stage is never blank."""
+    p = preset or {}
+    w = int(p.get("width", 1080))
+    h = int(p.get("height", 1920))
+    g_band = p.get("graphics_band", {})
+    g_top = int(g_band.get("top", 1140 if h >= w else 80))
+    g_bot = int(g_band.get("bottom", 1500 if h >= w else 860))
+    total = float(timeline_json.get("total", 45.0) or 45.0)
+    title = str((edl_json or {}).get("title") or "KEY TAKEAWAY").strip()
+    beats = _extract_hyperframes_beats(timeline_json, edl_json)
+
+    cx = w // 2
+    y_title = g_top + 48
+    y_sub = min(g_bot - 90, y_title + 92)
+    bx0, bx1 = max(80, cx - 390), min(w - 80, cx + 390)
+    by0, by1 = g_top + 28, min(g_bot - 28, y_title + 170)
+
+    cues_json: dict[str, Any] = {
+        "total": round(total, 2),
+        "title": title,
+        "beats": [],
+    }
+    js_lines = [
+        f"const TITLE = {json.dumps(title)};",
+        f'draw("fbFrame", pl("M{bx0} {by0 + 18} L{bx0} {by0} L{bx0 + 36} {by0} M{bx1 - 36} {by0} L{bx1} {by0} L{bx1} {by0 + 18} M{bx0} {by1 - 18} L{bx0} {by1} L{bx0 + 36} {by1} M{bx1 - 36} {by1} L{bx1} {by1} L{bx1} {by1 - 18}", 7, T));',
+        f'label("fbTitle", TITLE, 90, {y_title}, {{w: {w - 180}, size: 54, col: W}});',
+        'tl.set("#fbFrame,#fbTitle", {opacity: 1}, 0);',
+        'tl.set("#fbFrame .ln[pathLength]", {strokeDashoffset: 0}, 0);',
+    ]
+
+    # Group beats chronologically cleanly (non-overlapping card swaps across the safe band)
+    last_end = min(3.2, total)
+    js_lines.append(f'out("#fbFrame,#fbTitle", {max(0.4, last_end - 0.3):.2f});')
+    for idx, b in enumerate(beats[:8]):
+        s = max(last_end if idx > 0 else 0.0, float(b["start"]))
+        e = min(total, float(b["end"]))
+        if idx == 0:
+            s = max(0.0, float(b["start"]))
+            if e <= 3.2:
+                continue
+            s = 3.25
+        if e - s < 1.2:
+            continue
+        cue_text = b["note"] or b["say"][:48]
+        # Clean prefix like "Setup: "
+        if ":" in cue_text:
+            cue_text = cue_text.split(":", 1)[-1].strip()
+        cue_text = cue_text[:44].strip()
+        if not cue_text:
+            continue
+        bid = f"beat{idx}"
+        lid = f"lbl{idx}"
+        col_var = "T" if idx % 2 == 0 else "L"
+        cues_json["beats"].append({"id": bid, "start": round(s, 2), "end": round(e, 2), "text": cue_text})
+        js_lines.extend([
+            f'draw("{bid}", pl("M{cx - 260} {y_sub + 58} Q{cx} {y_sub + 44} {cx + 260} {y_sub + 58}", 7, {col_var}));',
+            f'label("{lid}", {json.dumps(cue_text)}, 90, {y_title + 26}, {{cv: 1, w: {w - 180}, size: 54, col: {col_var}}});',
+            f'strokes("{bid}", {s:.2f}, 0.45);',
+            f'lin("{lid}", {s + 0.08:.2f}, 0.38);',
+            f'out("#{bid},#{lid}", {max(s + 0.5, e - 0.28):.2f});',
+        ])
+        last_end = e
+
+    return cues_json, "\n".join(js_lines)
 
 
 def build_hyperframes_prompt(
     timeline_json: dict[str, Any],
     edl_json: dict[str, Any],
     preset: dict[str, Any] | None = None,
+    word_cues_text: str = "",
 ) -> str:
-    """Build the prompt for generating HyperFrames motion graphics (GSAP + SVG)."""
+    """Build a concise, focused prompt returning cues_json + scenes_js for our HyperFrames chalk scaffold."""
     p = preset or {}
-    w = p.get("width", 1080)
-    h = p.get("height", 1920)
-    fps = p.get("fps", 30)
-    total_dur = timeline_json.get("total", 60.0)
-    g_band = p.get("graphics_band", {"top": 1140, "bottom": 1500, "clip_path": "inset(1140px 0 420px 0)"})
+    w = int(p.get("width", 1080))
+    h = int(p.get("height", 1920))
+    fps = int(p.get("fps", 30))
+    total_dur = float(timeline_json.get("total", 60.0) or 60.0)
+    g_band = p.get("graphics_band", {"top": 1140, "bottom": 1500})
+    g_top = int(g_band.get("top", 1140 if h >= w else 80))
+    g_bot = int(g_band.get("bottom", 1500 if h >= w else 860))
     c_band = p.get("caption_band", {"top": 1500, "bottom": 1640})
 
-    timeline_str = json.dumps(timeline_json.get("parts", [])[:15], indent=2)
+    beats = _extract_hyperframes_beats(timeline_json, edl_json)
+    beats_str = json.dumps(beats, indent=2)
+    title = str((edl_json or {}).get("title") or "Motion Graphics").strip()
+    word_cues_block = f"\nSPOKEN WORD TIMESTAMPS (timeline seconds):\n```\n{word_cues_text[:5000]}\n```\n" if word_cues_text else ""
 
-    return f"""You are an elite motion designer building a HyperFrames composition for an overlay track.
-Dimensions: {w}x{h} at {fps}fps. Total Duration: {total_dur:.2f}s.
+    return f"""Do NOT read external workspace files, do NOT read skills, and do NOT run shell commands. All required inputs and helper APIs are provided below. Output JSON only.
 
-LAYOUT SAFETY BOUNDS:
-- Stage safe band: y={g_band.get('top', 1140)} to y={g_band.get('bottom', 1500)}.
-- Stage clip-path: {g_band.get('clip_path', 'inset(1140px 0 420px 0)')}.
-- Caption keep-out band: y={c_band.get('top', 1500)} to y={c_band.get('bottom', 1640)}.
-- ZERO graphics or text elements may ever render inside or occlude the caption band!
+You are designing hand-drawn sketchy chalkboard motion graphics for a {w}x{h} @ {fps}fps video ({total_dur:.2f}s total).
+Video Title: {json.dumps(title)}
 
-ASSETS & RUNTIME:
-- Local GSAP: <script src="assets/gsap.min.js"></script>
-- Cues script: <script src="cues.js"></script>
-- Local fonts: PermanentMarker ('assets/fonts/PermanentMarker.woff2') and Caveat-700 ('assets/fonts/Caveat-700.woff2').
-- SVG sketchy chalk and wob displacement filters in defs (#chalk and #wob).
-- Single GSAP master timeline:
-    const tl = gsap.timeline({{ paused: true }});
-    window.__timelines = window.__timelines || {{}};
-    window.__timelines["main"] = tl;
-- HARD GSAP RULE: NO CSS `transform` on GSAP target elements! GSAP must own all transforms (x, y, scale, rotation).
+STAGE BOUNDS & PALETTE:
+- Graphics safe band: x=80..{w - 80}, y={g_top}..{g_bot}. Keep EVERY SVG stroke and HTML label strictly inside this box!
+- Caption keep-out zone: y={c_band.get('top', 1500)}..{c_band.get('bottom', 1640)} (NOTHING may extend below y={g_bot}).
+- Already-defined JS palette constants: W="#F4EFE6" (warm chalk white), L="#C8F560" (dotted/highlight lime), T="#FF8A3D" (accent orange).
+- Do NOT put colored rectangles/boxes, opaque cards, or drop-shadow backgrounds behind illustrations; use clean hand-drawn SVG outlines, arrows, figures, props, and handwritten labels (`Marker` / `Caveat`).
 
-TIMELINE BEATS (First 15 parts):
-{timeline_str}
+ALREADY-SCAFFOLDED JS HELPERS YOU MUST CALL IN `scenes_js`:
+- `#stage`, `tl` (paused GSAP timeline), `C` (`window.CUES`), `W`, `L`, `T` are already initialized. DO NOT redeclare `tl`, `C`, `W`, `L`, `T`, `pl`, `dl`, `draw`, `label`, `G`, or HTML `<head>` tags!
+- `pl(pathD, strokeWidth, color)` -> sketchy double-pass chalk SVG stroke (`pathLength="1"`).
+- `dl(pathD, strokeWidth, color)` -> masked dotted lime/chalk SVG line (`.mk` inside `<mask>`).
+- `draw(id, svgMarkup, filterName)` -> mounts `<div id="{{id}}" class="g">` containing an SVG (`filterName`: `"chalk"` default or `"wob"`).
+- `label(id, htmlText, x, y, opts)` -> adds `.hw` text at `(x, y)` inside `y={g_top}..{g_bot}` (`opts`: `{{cv:1, size:56, w:400, col:T}}`). Note: Do NOT pass `rot` CSS transform on targets animated by GSAP! Keep all transforms inside GSAP (`rotation`, `x`, `y`, `scale`).
+- `G(x, y, scale, innerSvg)` -> groups `<g transform="translate(x,y) scale(scale)">`.
+- Timeline helpers:
+  - `strokes(id, t, dur, stagger)` -> animates `#id` strokes drawing in at `t`s.
+  - `dots(id, t, dur, stagger)` -> animates `dl()` dotted lines drawing in at `t`s.
+  - `lin(id, t, dur)` -> wipes text label left-to-right at `t`s.
+  - `pop(id, t, transformOrigin)` -> crisp impact stamp pop-in at `t`s.
+  - `pulse(sel, transformOrigin, t, scale)` / `shake(sel, t, amp, n)` / `swap(a, b, t)`.
+  - `out(selector, t, dy)` -> fades & drops elements cleanly out BEFORE next beat starts!
 
-OUTPUT FILES REQUIRED:
-1. 'index_html': Complete, standalone HTML entry point for HyperFrames with SVG paths, sketchy illustrations, and GSAP tweens synced to CUES.
-2. 'cues_json': JSON object mapping cue names to exact timestamp offsets from the timeline beats, plus 'total': {total_dur:.2f}.
-3. 'cues_mjs': Node.js script synchronizing cues.json to cues.js and updating data-duration on index.html:
+CHOREOGRAPHY REQUIREMENTS:
+1. Frame 0 visibility: Ensure the opening hook title/icon is ALREADY visibly drawn at `t=0` (`tl.set("#hookId", {{opacity:1}}, 0); tl.set("#hookId .ln[pathLength]", {{strokeDashoffset:0}}, 0);`) so frame 0 is never blank (`first_frame_empty`).
+2. Bespoke visual metaphors per beat: For EACH narrative beat (`hook`, `setup`, `twist`, `climax`, `loop`), draw recognizable simple props matching that beat's `say` & `note` (e.g., pizza slice, masks, scales, arrows, figures, checkmarks, comparison diagrams — never blank screens or single static text!).
+3. Strict non-overlap cleanup: Call `out("#prevIds...", endTime - 0.28)` before the next beat arrives so elements never stack on top of old elements.
+4. Keep `scenes_js` clean, bug-free ES6 JS (around 45-130 lines total, zero syntax errors).
+
+MERGED TIMELINE BEATS & VISUAL NOTES:
+{beats_str}
+{word_cues_block}
+OUTPUT JSON SCHEMA:
+- `cues_json`: object containing `"total": {total_dur:.2f}` plus named timestamp objects for each beat.
+- `scenes_js`: JavaScript body calling `draw(...)`, `label(...)`, `strokes(...)`, `dots(...)`, `lin(...)`, `pop(...)`, `out(...)` referenced cleanly against `C.*` cues.
+
+Output valid JSON with keys `cues_json` and `scenes_js`. Output JSON only."""
+
+
+def build_hyperframes_revision_prompt(
+    issues: list[str],
+    fixes_needed: list[str],
+    cues_json: dict[str, Any],
+    scenes_js: str,
+    timeline_json: dict[str, Any],
+    edl_json: dict[str, Any],
+    preset: dict[str, Any] | None = None,
+) -> str:
+    """Build a focused revision prompt after hyperframes check or Vision Art Director flags issues."""
+    p = preset or {}
+    w = int(p.get("width", 1080))
+    h = int(p.get("height", 1920))
+    g_band = p.get("graphics_band", {"top": 1140 if h >= w else 80, "bottom": 1500 if h >= w else 860})
+    beats = _extract_hyperframes_beats(timeline_json, edl_json)
+    return f"""Do NOT read external workspace files or run shell commands. Output JSON only.
+
+The Vision Art Director / HyperFrames DOM audit REJECTED the current motion graphics for failing QA checks.
+Fix ALL reported issues and return updated `cues_json` + `scenes_js`.
+
+REPORTED ISSUES:
+{json.dumps(issues, indent=2)}
+
+REQUIRED FIXES:
+{json.dumps(fixes_needed, indent=2)}
+
+LAYOUT & CONSTRAINTS:
+- Safe graphics band: x=80..{w - 80}, y={g_band.get('top', 1140)}..{g_band.get('bottom', 1500)}.
+- Key hook element must already be visible at t=0 (`tl.set(..., {{opacity:1}}, 0)` + `strokeDashoffset:0`).
+- Every beat must animate visibly inside `#stage` using `draw`, `label`, `pl`, `dl`, `strokes`, `lin`, `pop`, `out` (`W`, `L`, `T`, `tl`, `C` already defined).
+
+TIMELINE BEATS:
+{json.dumps(beats, indent=2)}
+
+CURRENT cues_json:
+{json.dumps(cues_json, indent=2)}
+
+CURRENT scenes_js:
 ```javascript
-import fs from 'fs';
-const c = JSON.parse(fs.readFileSync('cues.json', 'utf8'));
-fs.writeFileSync('cues.js', 'window.CUES=' + JSON.stringify(c) + ';\\n');
-const h = fs.readFileSync('index.html', 'utf8').replace(/data-duration="[^"]*"/, `data-duration="${{c.total}}"`);
-fs.writeFileSync('index.html', h);
+{scenes_js}
 ```
 
-Return valid JSON with keys index_html, cues_json, cues_mjs. Output JSON only."""
+Output valid JSON with updated `cues_json` and `scenes_js`. Output JSON only."""
 
 
 def build_audio_spotcheck_prompt(
@@ -697,13 +951,15 @@ Referenced files to inspect:
 - Timing cues: {cues_json_path}
 
 CRITICAL CHECKS:
-1. Layout Safe Area:
+1. Non-Blank Animated Presence:
+   - Snapshots MUST contain crisp, visible hand-drawn graphics/labels (blank transparent frames = automatic `passes: false`).
+2. Layout Safe Area:
    - All graphics must sit strictly within y={g_top}..{g_bot}.
    - The caption band y={c_top}..{c_bot} must remain completely clear and unobstructed.
-2. Visual Aesthetic:
+3. Visual Aesthetic:
    - Hand-drawn sketchy chalk aesthetic (#F4EFE6 warm white, #FF8A3D warm accent, #C8F560 lime).
-   - High legibility, organic motion, zero ugly clipping or cut-off labels.
-3. Determine if the composition passes or requires a revision pass.
+   - High legibility, zero overlapping stale beat elements, zero ugly clipping or cut-off labels.
+4. Set `passes: false` if any keyframe looks blank, clipped, cluttered, or unreadable, and list exact concrete changes in `fixes_needed`.
 
 Return valid JSON conforming to the vision critique schema. Output JSON only."""
 
@@ -712,25 +968,34 @@ def build_cover_prompt(
     candidate_frames: list[str],
     title_options: list[str],
     preset: dict[str, Any] | None = None,
+    has_sticker: bool = False,
 ) -> str:
     """Build the prompt for choosing cover frames and title layouts."""
     frames_list = "\n".join(f"- {f}" for f in candidate_frames)
     titles_list = "\n".join(f"- {t}" for t in title_options)
+    sticker_note = (
+        "- A transparent graphic sticker extracted from the motion overlay will be placed at y~1235 (Layout A) or top y~170 (Layout B)."
+        if has_sticker
+        else "- No graphics sticker is overlaid on covers; use Layout A (title top y~190) or Layout B (title lower chest y~1190) cleanly framing the speaker's face!"
+    )
 
-    return f"""You are a thumbnail designer optimizing for maximum Click-Through Rate (CTR) on TikTok and Shorts.
+    return f"""Inspect the listed candidate frame images directly; do not run shell commands.
 
-CANDIDATE FRAMES:
+You are a thumbnail designer optimizing for maximum Click-Through Rate (CTR) on TikTok, Reels, and Shorts.
+
+CANDIDATE FRAMES (uncaptioned, 1080x1920):
 {frames_list}
 
-HOOK TITLES:
+HOOK TITLES / CONTEXT:
 {titles_list}
 
 RULES FOR COVERS:
-- Layout A: Title at top (y~190), sticker/graphic lower (y~1235).
-- Layout B: Sticker at top (y~170), title lower (y~1060).
-- Titles must be 3 rows max, formatted as `[[[text, color]], ...]`.
+- Layout A: Title top (y~190). Best when speaker's eyes/face sit lower half or clear of top band y=180..520.
+- Layout B: Lower headline (y~1190, below chin/mouth). Pick ONLY frames where the speaker's face is high enough that y>=1190 sits cleanly on chest/torso and NEVER covers eyes, nose, or mouth! If unsure, use Layout A and pick a crisp eyes-open frame where forehead/top margin has space.
+{sticker_note}
+- Titles must be <=3 short lines, max 2-4 words per line, formatted as `[[["WORD", "w"], [" KEYWORD", "p"]], ...]` so `cover.py` wraps cleanly inside width 940px.
 - Available colors: 'w' (white [255,255,255]), 'p' (pink [255,79,160]), 'b' (blue [61,107,255]).
-- Choose the sharpest, most expressive candidate frame for Cover A and Cover B.
+- Pick two DIFFERENT expressions/frames for Cover A and Cover B (A = punch angle, B = curiosity angle).
 
 Return valid JSON conforming to the cover selector schema. Output JSON only."""
 
@@ -739,39 +1004,39 @@ def build_descriptions_prompt(
     final_transcript: str,
     script_text: str,
     summary: str,
-    series_day: int = 6,
+    story_prompt: str = "",
 ) -> str:
-    """Build the prompt for generating 5 distinct TikTok description options."""
-    return f"""You are a TikTok copywriter for a creator who posts raw, thoughtful 'burst your bubble' monologues filmed on night walks.
+    """Build the prompt for generating 5 distinct TikTok/Reels description options grounded strictly in the actual video."""
+    angle_block = f"\nCREATOR DIRECTION / SERIES CONTEXT:\n{story_prompt.strip()}\n" if story_prompt and story_prompt.strip() else ""
 
-VIDEO SUMMARY:
+    return f"""Do NOT inspect files or run shell commands. Work strictly from the provided video transcript and script below. Output valid JSON only.
+
+You are a social video copywriter crafting 5 angle-distinct post descriptions (captions + hashtags + pinned comments) strictly grounded in what the speaker actually filmed and said.
+
+VIDEO TITLE / SUMMARY:
 {summary}
-
-SCRIPT:
+{angle_block}
+APPROVED SCRIPT TEXT:
 ```
-{script_text}
-```
-
-FINAL TRANSCRIPT:
-```
-{final_transcript[:3000]}
+{script_text[:6000]}
 ```
 
-IMPORTANT:
-- Respect hypotheticals: the speaker does not claim personal preferences or beliefs that were only thought experiments; never invent claims.
-- Series: 'burst your bubble', continuing 'Day 1: afraid of the camera' (this is Day {series_day}).
+FINAL TRANSCRIPT (WHAT IS ACTUALLY HEARD):
+```
+{final_transcript[:4000]}
+```
 
-Write FIVE distinct options with different angles:
-(1) direct question hook
-(2) story teaser/cliffhanger
-(3) honest/confessional
-(4) debate-bait inviting comments
-(5) minimal & intriguing
+GROUNDING RULES:
+- Never invent filming locations, weather/time-of-day ("night walk"), episode numbers, or creator backstory unless explicitly stated in the transcript or CREATOR DIRECTION above!
+- Respect hypotheticals: if the speaker used a thought experiment, keep it framed as an example/idea rather than a false personal confession.
+- Sound authentic, conversational, and concise (zero spammy hashtags like #fyp).
 
-Format each option with:
-- Caption: 90-160 chars before hashtags, <=2 emojis, none required.
-- Hashtags: 3-5 tags (#burstyourbubble + topic tags, no spammy #fyp).
-- Pinned comment: One-line idea inviting the long story.
-- Recommendation: Add a 'which to pick' line with a 1-sentence reason.
+Write FIVE distinct options in the JSON fields:
+- `hook`: Direct question hook (90-160 chars + 3-5 topical hashtags + 1-line pinned comment)
+- `teaser`: Story teaser / curiosity gap
+- `confessional`: Honest personal reflection grounded in the actual speech
+- `debate`: Balanced debate-bait inviting real viewer stories in comments
+- `minimal`: Clean 1-2 sentence minimal caption
+- `recommendation`: Which option (1-5) to pick and a 1-sentence reason why.
 
-Output the complete text for descriptions."""
+Return valid JSON conforming to DESCRIPTIONS_SCHEMA. Output JSON only."""

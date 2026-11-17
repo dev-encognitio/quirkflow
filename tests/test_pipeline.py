@@ -929,3 +929,321 @@ class TestAgyModelsAndCopilot:
         assert any(p.get("kind") == "delta" and "Checked EDL." in p.get("preview", "") for p in seen_progress)
 
 
+# ============================================================================
+# 7. REGRESSION TESTS FOR QUALITY, PROMPT, HYPERFRAMES & UI/SERVER FIXES
+# ============================================================================
+
+class TestPipelineRegressionFixes:
+    def test_render_hyperframes_index_html_and_fallback_pass_check(self):
+        from agent_prompts import build_fallback_scenes_js, render_hyperframes_index_html
+
+        preset = get_preset("story_vertical")
+        timeline_json = {
+            "total": 12.0,
+            "parts": [
+                {"clip": "c01", "start": 0.0, "end": 4.0, "note": "hook perspective"},
+                {"clip": "c02", "start": 4.0, "end": 8.0, "note": "pineapple vs phone"},
+                {"clip": "c03", "start": 8.0, "end": 12.0, "note": "step out and reset"},
+            ],
+        }
+        edl_json = {
+            "title": "PINEAPPLE PERSPECTIVE",
+            "parts": timeline_json["parts"],
+        }
+        cues_data, scenes_js = build_fallback_scenes_js(timeline_json, edl_json, preset)
+        assert cues_data.get("total") == pytest.approx(12.0)
+        assert "tl.set" in scenes_js
+
+        html = render_hyperframes_index_html(preset, scenes_js, 12.0)
+
+        with tempfile.TemporaryDirectory() as td:
+            hf_dir = Path(td) / "hf"
+            assets_dir = hf_dir / "assets"
+            fonts_dir = assets_dir / "fonts"
+            fonts_dir.mkdir(parents=True, exist_ok=True)
+
+            v6_hf_assets = adapters.V6_REF_DIR / "hf" / "assets"
+            if (v6_hf_assets / "gsap.min.js").exists():
+                shutil.copy2(v6_hf_assets / "gsap.min.js", assets_dir / "gsap.min.js")
+            for f in (v6_hf_assets / "fonts").glob("*.woff2"):
+                shutil.copy2(f, fonts_dir / f.name)
+
+            (hf_dir / "hyperframes.json").write_text(
+                json.dumps(
+                    {
+                        "$schema": "https://hyperframes.heygen.com/schema/hyperframes.json",
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30,
+                        "duration": 12.0,
+                    }
+                )
+            )
+            (hf_dir / "cues.json").write_text(json.dumps(cues_data, indent=2))
+            (hf_dir / "cues.js").write_text(f"window.CUES={json.dumps(cues_data)};\n")
+            (hf_dir / "index.html").write_text(html)
+
+            res = subprocess.run(
+                [adapters.HYPERFRAMES_BIN, "check", str(hf_dir), "--json"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            assert res.returncode == 0, f"hyperframes check failed: {res.stdout}\n{res.stderr}"
+            check_data = json.loads(res.stdout)
+            assert check_data.get("ok") is True
+            assert check_data.get("lint", {}).get("errorCount", 0) == 0
+            has_issues, issues = adapters._extract_check_issues(res.stdout)
+            assert not has_issues, f"Unexpected check issues on fallback composition: {issues}"
+
+    @pytest.mark.asyncio
+    async def test_run_build_and_qa_merges_edl_highlights_gamma_and_checks_rebuild(self):
+        assert adapters._normalize_ass_color("#FF8A3D") == "&H3D8AFF&"
+        assert adapters._normalize_ass_color("&HA04FFF&") == "&HA04FFF&"
+
+        with tempfile.TemporaryDirectory() as td:
+            job_dir = Path(td)
+            work_dir = job_dir / "work"
+            src_dir = work_dir / "src"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            (src_dir / "c01.mp4").write_bytes(b"fake")
+
+            (work_dir / "words.json").write_text(
+                json.dumps(
+                    {
+                        "c01": [
+                            {"start": 0.0, "end": 0.5, "word": "Check"},
+                            {"start": 0.5, "end": 1.0, "word": "perspective"},
+                            {"start": 1.0, "end": 1.5, "word": "now."},
+                        ]
+                    }
+                )
+            )
+            (work_dir / "ingest_meta.json").write_text(
+                json.dumps({"suggested_gamma": 1.15, "avg_luma": 39.2})
+            )
+            (work_dir / "edl.json").write_text(
+                json.dumps(
+                    {
+                        "title": "Test",
+                        "parts": [{"clip": "c01", "range": [0.0, 1.5], "note": "hook"}],
+                        "highlight": {"perspective": "#FF8A3D", "focus": "&H60F5C8&"},
+                        "names": {"emma": "Emma"},
+                    }
+                )
+            )
+
+            seen_cmds: list[list[str]] = []
+
+            async def fake_run_proc(cmd, cwd=None, timeout_s=None, cancel_event=None, log_cb=None, env=None):
+                seen_cmds.append(list(cmd))
+                cmd_str = " ".join(str(x) for x in cmd)
+                if "build.py" in cmd_str:
+                    (work_dir / "base.mp4").write_bytes(b"mp4-v2" if (work_dir / "cuts.json").exists() else b"mp4-v1")
+                    (work_dir / "timeline.json").write_text(
+                        json.dumps({"total": 1.5, "parts": [{"clip": "c01", "start": 0.0, "end": 1.5}]})
+                    )
+                    return (0, "built ok", "")
+                if "qa.py" in cmd_str:
+                    (work_dir / "bursts.json").write_text("[]")
+                    return (0, "QA PASS", "")
+                if "stutters.py" in cmd_str:
+                    (work_dir / "cuts_proposed.json").write_text(json.dumps({"c01": [[0.45, 0.50]]}))
+                    return (0, "1 stutter", "")
+                if "base16.wav" in cmd_str:
+                    (work_dir / "base16.wav").write_bytes(b"RIFF")
+                    return (0, "", "")
+                if "scriptdiff.py" in cmd_str:
+                    return (0, "word match ratio 0.95", "")
+                return (0, "", "")
+
+            with mock.patch("adapters._run_proc", side_effect=fake_run_proc), mock.patch(
+                "adapters.probe_media",
+                return_value={"duration_s": 1.45, "width": 1080, "height": 1920, "fps": 30.0},
+            ):
+                res = await adapters.run_build_and_qa(job_dir, get_preset("story_vertical"))
+
+            cfg = json.loads((work_dir / "config.json").read_text())
+            assert cfg["gamma"] == pytest.approx(1.15)
+            assert cfg["highlight"]["perspective"] == "&H3D8AFF&"
+            assert cfg["highlight"]["focus"] == "&H60F5C8&"
+            assert cfg["names"]["emma"] == "Emma"
+            assert res["stutters_cut"] == 1
+            assert res["script_match_pct"] == pytest.approx(95.0)
+
+            build_calls = [c for c in seen_cmds if any("build.py" in str(x) for x in c)]
+            qa_calls = [c for c in seen_cmds if any("qa.py" in str(x) for x in c)]
+            assert len(build_calls) == 2
+            assert len(qa_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_run_agy_json_flags_and_motion_graphics_vision_revision(self):
+        recorded_agy_cmds: list[tuple[list[str], str]] = []
+
+        async def fake_run_proc_agy(cmd, cwd=None, timeout_s=None, cancel_event=None, log_cb=None, env=None):
+            recorded_agy_cmds.append((list(cmd), str(cwd)))
+            return (0, json.dumps({"status": "SUCCESS", "structured_output": {"ok": True}}), "")
+
+        with mock.patch("adapters._run_proc", side_effect=fake_run_proc_agy):
+            out = await adapters.run_agy_json("ping", schema={"type": "object"}, model="gemini-4-hydrogen-medium")
+        assert out == {"ok": True}
+        cmd0, cwd0 = recorded_agy_cmds[0]
+        assert "--disable-slash-commands" in cmd0
+        assert "--new-project" in cmd0
+        assert cwd0 == "/tmp"
+
+        # Now test run_motion_graphics runs revision pass when Vision critiques passes=False
+        calls: list[dict[str, Any]] = []
+
+        async def fake_run_agy_json(prompt, schema=None, model=None, cwd=None, add_dirs=None, timeout_s=None, **kw):
+            calls.append({"prompt": prompt, "schema": schema, "model": model})
+            if len(calls) == 1:
+                return {
+                    "cues_json": {"total": 10.0, "hook": 0.0},
+                    "scenes_js": 'draw("d1", pl("M100 1200 L500 1200", 6, W)); tl.set("#d1", {opacity: 1}, 0); strokes("d1", 0, 0.4);',
+                }
+            if len(calls) == 2:
+                return {
+                    "passes": False,
+                    "critique": "Initial draw missed main label",
+                    "issues": ["Blank frame at t=0"],
+                    "fixes_needed": ["Render title label visible at t=0"],
+                }
+            return {
+                "cues_json": {"total": 10.0, "hook": 0.0},
+                "scenes_js": 'draw("d1", pl("M100 1200 L500 1200", 6, W)); label("l1", "FIXED", 140, 1180); tl.set("#l1", {opacity: 1}, 0); strokes("d1", 0, 0.4);',
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            job_dir = Path(td)
+            work_dir = job_dir / "work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / "timeline.json").write_text(json.dumps({"total": 10.0, "parts": [{"clip": "c01", "start": 0.0, "end": 10.0, "note": "hook"}]}))
+            (work_dir / "edl.json").write_text(json.dumps({"title": "Demo", "parts": [{"clip": "c01", "range": [0.0, 10.0], "note": "hook"}]}))
+
+            async def fake_hf_proc(cmd, cwd=None, timeout_s=None, cancel_event=None, log_cb=None, env=None):
+                cmd_s = " ".join(str(x) for x in cmd)
+                if "check" in cmd_s:
+                    return (0, json.dumps({"ok": True, "lint": {"errorCount": 0}}), "")
+                if "render" in cmd_s:
+                    (work_dir / "overlay.mov").write_bytes(b"MOV")
+                return (0, "", "")
+
+            with mock.patch("adapters.run_agy_json", side_effect=fake_run_agy_json), mock.patch(
+                "adapters._run_proc", side_effect=fake_hf_proc
+            ):
+                res = await adapters.run_motion_graphics(
+                    job_dir,
+                    get_preset("story_vertical"),
+                    creative_model="gemini-4-hydrogen-xhigh",
+                    vision_model="gemini-4-hydrogen-medium",
+                )
+
+            assert len(calls) == 3
+            assert "Blank frame at t=0" in calls[2]["prompt"]
+            assert res["vision_critique"]["passes"] is False
+            html_final = (job_dir / "hf" / "index.html").read_text()
+            assert 'label("l1", "FIXED"' in html_final
+
+    @pytest.mark.asyncio
+    async def test_uncaptioned_cover_candidates_and_neutral_descriptions_prompt(self):
+        from agent_prompts import build_descriptions_prompt
+
+        desc_prompt = build_descriptions_prompt(
+            final_transcript="You can rotate a pineapple in your head.",
+            script_text="Look at a pineapple from another side.",
+            summary="PINEAPPLE PERSPECTIVE",
+            story_prompt="Reflective psychology insight",
+        )
+        assert "Day 6 of burst your bubble" not in desc_prompt
+        assert "Always filmed on night walks" not in desc_prompt
+        assert "Never invent filming locations" in desc_prompt
+        assert "Reflective psychology insight" in desc_prompt
+
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td) / "work"
+            src_dir = work_dir / "src"
+            cover_dir = work_dir / "cover"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            cover_dir.mkdir(parents=True, exist_ok=True)
+
+            # Generate synthetic uncaptioned source clip; omit base.mp4 completely
+            src_clip = src_dir / "c01.mp4"
+            ff = subprocess.run(
+                [
+                    adapters.FFMPEG_BIN,
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=navy:s=270x480:d=2",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(src_clip),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert ff.returncode == 0, ff.stderr
+
+            (work_dir / "timeline.json").write_text(
+                json.dumps(
+                    {
+                        "total": 2.0,
+                        "parts": [{"clip": "c01", "start": 0.0, "end": 2.0, "subs": [[0.2, 1.8, "test line"]]}],
+                    }
+                )
+            )
+            frames = await adapters._extract_cover_candidates(work_dir, cover_dir, get_preset("story_vertical"))
+            assert len(frames) == 8
+            assert all(Path(f).exists() and Path(f).stat().st_size > 0 for f in frames)
+
+    def test_enrich_job_deduplicates_bgm_and_start_job_force_clears_stale_errors(self):
+        with tempfile.TemporaryDirectory() as td:
+            jm = JobManager(jobs_root=Path(td))
+            job = jm.create_job(preset_id="story_vertical", clip_paths=[])
+            jid = job["id"]
+            job_dir = jm.jobs_root / jid
+
+            cand_dir = job_dir / "work" / "assets" / "bgm" / "candidates"
+            cand_dir.mkdir(parents=True, exist_ok=True)
+            (cand_dir / "track.mp3").write_bytes(b"ID3")
+            active_link = job_dir / "work" / "assets" / "bgm" / "track.mp3"
+            active_link.symlink_to(cand_dir / "track.mp3")
+
+            with mock.patch("server.JOBS_ROOT", Path(td)):
+                enriched = enrich_job(jm.get_job(jid))
+            assert len(enriched["bgm_candidates"]) == 1
+            assert enriched["bgm_candidates"][0]["filename"] == "track.mp3"
+
+            # Simulate prior failure + stale downstream completion before Retry: EDL
+            j = jm.get_job(jid)
+            j["status"] = "failed"
+            j["error"] = "old upstream failure"
+            j["stages"]["ingest"]["status"] = "completed"
+            j["stages"]["script"]["status"] = "completed"
+            j["stages"]["edl"]["status"] = "failed"
+            j["stages"]["edl"]["error"] = "bad edl"
+            j["stages"]["base_cut"]["status"] = "completed"
+            jm._save_job(j)
+
+            def _fake_create_task(coro):
+                coro.close()
+                return mock.MagicMock(done=lambda: True)
+
+            with mock.patch("orchestrator.asyncio.create_task", side_effect=_fake_create_task):
+                restarted = jm.start_job(jid, from_stage="edl", force=True)
+
+            assert restarted["status"] == "running"
+            assert restarted["error"] is None
+            assert restarted["stages"]["ingest"]["status"] == "completed"
+            assert restarted["stages"]["script"]["status"] == "completed"
+            assert restarted["stages"]["edl"]["status"] == "pending"
+            assert restarted["stages"]["edl"]["error"] is None
+            assert restarted["stages"]["base_cut"]["status"] == "pending"
+
+
+

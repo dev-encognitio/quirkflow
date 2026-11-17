@@ -1102,9 +1102,10 @@ function renderGateA(job) {
   }
 
   const editor = document.getElementById("gate-a-script-editor");
-  if (editor && options.length > 0 && !editor.value) {
+  if (editor && options.length > 0 && (editor.dataset.jobId !== job.id || !editor.value)) {
     const activeOpt = options.find(o => o.id === state.selectedScriptOption) || options[0];
     editor.value = activeOpt?.script_text || "";
+    editor.dataset.jobId = job.id;
   }
 }
 
@@ -1131,9 +1132,17 @@ function renderGateB(job) {
 
   // Video Player for Base Cut
   const videoPlayer = document.getElementById("base-video-player");
-  if (videoPlayer && job.base_video_url) {
-    if (videoPlayer.getAttribute("src") !== job.base_video_url) {
-      videoPlayer.src = job.base_video_url;
+  const baseVer =
+    job.stages?.base_cut?.completed_at ||
+    job.stages?.bgm_broll?.completed_at ||
+    job.updated_at ||
+    "1";
+  const baseUrl = job.base_video_url
+    ? `${job.base_video_url}${job.base_video_url.includes("?") ? "&" : "?"}v=${encodeURIComponent(baseVer)}`
+    : "";
+  if (videoPlayer && baseUrl) {
+    if (videoPlayer.getAttribute("src") !== baseUrl) {
+      videoPlayer.src = baseUrl;
     }
   }
 
@@ -1199,16 +1208,28 @@ function renderDeliveryDeck(job) {
   }
   panel.classList.remove("hidden");
 
+  const cacheBust = (url, ver) => {
+    if (!url) return "";
+    const sep = url.includes("?") ? "&" : "?";
+    return `${url}${sep}v=${encodeURIComponent(ver)}`;
+  };
+  const deliveryVer =
+    job.stages?.deliverables?.completed_at ||
+    job.stages?.composite?.completed_at ||
+    job.updated_at ||
+    "1";
+
   // Video Player
   const finalPlayer = document.getElementById("final-video-player");
   const downloadBtn = document.getElementById("btn-download-final");
-  if (finalPlayer && job.final_video_url) {
-    if (finalPlayer.getAttribute("src") !== job.final_video_url) {
-      finalPlayer.src = job.final_video_url;
+  const finalUrl = cacheBust(job.final_video_url, deliveryVer);
+  if (finalPlayer && finalUrl) {
+    if (finalPlayer.getAttribute("src") !== finalUrl) {
+      finalPlayer.src = finalUrl;
     }
   }
-  if (downloadBtn && job.final_video_url) {
-    downloadBtn.href = job.final_video_url;
+  if (downloadBtn && finalUrl) {
+    downloadBtn.href = finalUrl;
   }
 
   // QA Scorecard
@@ -1226,11 +1247,13 @@ function renderDeliveryDeck(job) {
     const linkA = document.getElementById("link-cover-a");
     const imgB = document.getElementById("img-cover-b");
     const linkB = document.getElementById("link-cover-b");
+    const cAUrl = cacheBust(cA.url, deliveryVer);
+    const cBUrl = cacheBust(cB.url, deliveryVer);
 
-    if (imgA) imgA.src = cA.url;
-    if (linkA) linkA.href = cA.url;
-    if (imgB) imgB.src = cB.url;
-    if (linkB) linkB.href = cB.url;
+    if (imgA) imgA.src = cAUrl;
+    if (linkA) linkA.href = cAUrl;
+    if (imgB) imgB.src = cBUrl;
+    if (linkB) linkB.href = cBUrl;
   }
 
   // Descriptions Data

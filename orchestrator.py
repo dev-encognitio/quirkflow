@@ -713,6 +713,26 @@ class JobManager:
         self._active_tasks[job_id] = task
 
         job["status"] = "running"
+        job["error"] = None
+
+        reset_from: str | None = None
+        if from_stage and from_stage in STAGE_ORDER:
+            reset_from = from_stage
+        elif force:
+            reset_from = STAGE_ORDER[0]
+
+        if reset_from:
+            reset_idx = STAGE_ORDER.index(reset_from)
+            for s in STAGE_ORDER[reset_idx:]:
+                if s in job.get("stages", {}):
+                    job["stages"][s] = {
+                        "status": "pending",
+                        "started_at": None,
+                        "completed_at": None,
+                        "error": None,
+                        "artifacts": {},
+                    }
+
         self._save_job(job)
         self.publish(job_id, "job_started", {"from_stage": from_stage})
         return job
@@ -731,6 +751,30 @@ class JobManager:
             self.publish(job_id, "job_cancelled", {})
             return True
         return False
+
+    @staticmethod
+    def _load_clip_summary(work_dir: Path) -> str:
+        """Format concise per-clip duration and resolution metadata for prompts."""
+        clip_map_path = work_dir / "clip_map.json"
+        if not clip_map_path.exists():
+            return ""
+        try:
+            clip_map = json.loads(clip_map_path.read_text())
+        except Exception:
+            return ""
+        if not isinstance(clip_map, dict) or not clip_map:
+            return ""
+        lines = []
+        for cid, meta in clip_map.items():
+            if not isinstance(meta, dict):
+                continue
+            stem = meta.get("stem") or cid
+            dur = meta.get("duration_s")
+            w, h = meta.get("width"), meta.get("height")
+            dur_str = f"{dur}s" if dur is not None else "?"
+            res_str = f"{w}x{h}" if w and h else "?"
+            lines.append(f"- {cid} ({stem}): {dur_str}, {res_str}")
+        return "\n".join(lines)
 
     async def _run_job_loop(
         self,
@@ -773,6 +817,8 @@ class JobManager:
                 break
 
             job["current_stage"] = stage
+            job["error"] = None
+            job["stages"][stage]["error"] = None
             job["stages"][stage]["status"] = "running"
             job["stages"][stage]["started_at"] = datetime.now(timezone.utc).isoformat()
             self._save_job(job)
@@ -813,6 +859,7 @@ class JobManager:
                 elif stage == "script":
                     transcript_text = (work_dir / "transcript_all.txt").read_text()
                     guide_summary = GUIDE_MD_PATH.read_text() if GUIDE_MD_PATH.exists() else None
+                    clip_summary = self._load_clip_summary(work_dir)
 
                     _log(f"[SCRIPT] Generating 3 script options via AGY ({creative_model})...")
                     gen_prompt = build_script_generation_prompt(
@@ -820,6 +867,7 @@ class JobManager:
                         guide_summary,
                         preset,
                         story_prompt=job.get("story_prompt", ""),
+                        clip_summary=clip_summary,
                     )
                     options_res = await run_agy_json(
                         gen_prompt,
@@ -876,9 +924,16 @@ class JobManager:
                     words_by_clip = json.loads((work_dir / "words.json").read_text())
                     words_summary = format_words_for_edl(words_by_clip)
                     transcript_text = (work_dir / "transcript_all.txt").read_text()
+                    clip_summary = self._load_clip_summary(work_dir)
 
                     _log(f"[EDL] Generating Edit Decision List (EDL) via AGY ({mechanical_model})...")
-                    edl_prompt = build_edl_prompt(selected_script, words_summary, transcript_text, preset)
+                    edl_prompt = build_edl_prompt(
+                        selected_script,
+                        words_summary,
+                        transcript_text,
+                        preset,
+                        clip_summary=clip_summary,
+                    )
                     raw_edl = await run_agy_json(
                         edl_prompt,
                         schema=EDL_SCHEMA,
@@ -975,6 +1030,8 @@ class JobManager:
                 job = self.get_job(job_id)
                 if not job:
                     break
+                job["error"] = None
+                job["stages"][stage]["error"] = None
                 job["stages"][stage]["status"] = "completed"
                 job["stages"][stage]["completed_at"] = datetime.now(timezone.utc).isoformat()
                 self._save_job(job)
