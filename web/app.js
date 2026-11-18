@@ -707,11 +707,65 @@ async function patchJobModels(silent = false) {
   }
 }
 
+function renderPresetCards(presets) {
+  const container = document.getElementById("presets-container");
+  if (!container || !Array.isArray(presets) || presets.length === 0) return;
+
+  const validIds = new Set(presets.map(p => p.id));
+  if (!validIds.has(state.selectedPreset)) {
+    state.selectedPreset = validIds.has("story_vertical") ? "story_vertical" : presets[0].id;
+  }
+
+  const corePresets = presets.filter(p => (p.category || "core") === "core");
+  const refPresets = presets.filter(p => p.category === "reference");
+
+  const renderCard = (p) => {
+    const isActive = p.id === state.selectedPreset;
+    const tags = Array.isArray(p.tags) && p.tags.length
+      ? p.tags
+      : [p.aspect_ratio || "9:16", p.duration_hint || ""].filter(Boolean);
+    const isRef = p.category === "reference";
+    const metaTags = [
+      ...(isRef ? ['<span class="tag tag-accent">Reference Style</span>'] : []),
+      ...tags.map(t => `<span class="tag">${escapeHtml(String(t))}</span>`),
+      ...(p.duration_hint && !tags.includes(p.duration_hint) ? [`<span class="tag">${escapeHtml(String(p.duration_hint))}</span>`] : []),
+    ].join("");
+
+    return `
+      <div class="preset-card${isActive ? " active" : ""}" data-preset="${escapeHtml(p.id)}">
+        <div class="preset-radio"><span class="radio-dot"></span></div>
+        <div class="preset-content">
+          <div class="preset-name">${escapeHtml(p.name || p.id)}</div>
+          <div class="preset-desc">${escapeHtml(p.description || "")}</div>
+          <div class="preset-meta">${metaTags}</div>
+        </div>
+      </div>
+    `;
+  };
+
+  let html = "";
+  if (corePresets.length) {
+    html += `<div class="preset-group-heading"><span>Core Formats</span><span>${corePresets.length}</span></div>`;
+    html += corePresets.map(renderCard).join("");
+  }
+  if (refPresets.length) {
+    html += `<div class="preset-group-heading"><span>Promoted Viral Reference Styles</span><span>${refPresets.length}</span></div>`;
+    html += refPresets.map(renderCard).join("");
+  }
+  if (!corePresets.length && !refPresets.length) {
+    html = presets.map(renderCard).join("");
+  }
+  container.innerHTML = html;
+}
+
 async function loadPresetsConfig() {
   try {
     const res = await fetch("/api/presets");
     if (!res.ok) return;
     const data = await res.json();
+    if (Array.isArray(data.presets) && data.presets.length > 0) {
+      renderPresetCards(data.presets);
+    }
     if (data.stages && data.stages.length) {
       STAGE_ORDER = data.stages;
       const retrySelect = document.getElementById("select-retry-stage");
@@ -739,15 +793,17 @@ async function loadPresetsConfig() {
 }
 
 function initPresetsAndOptions() {
-  // Preset card selection
-  const presetCards = document.querySelectorAll(".preset-card");
-  presetCards.forEach(card => {
-    card.addEventListener("click", () => {
-      presetCards.forEach(c => c.classList.remove("active"));
+  // Delegated preset card selection (works seamlessly for dynamically loaded cards)
+  const container = document.getElementById("presets-container");
+  if (container) {
+    container.addEventListener("click", (e) => {
+      const card = e.target.closest(".preset-card");
+      if (!card || !container.contains(card)) return;
+      container.querySelectorAll(".preset-card").forEach(c => c.classList.remove("active"));
       card.classList.add("active");
       state.selectedPreset = card.dataset.preset;
     });
-  });
+  }
 
   // Whisper Accuracy segmented control
   const whisperBtns = document.querySelectorAll("#whisper-control .segment-btn");

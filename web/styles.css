@@ -789,31 +789,54 @@ body.studio-dark {
    Presets & Video Architecture
    -------------------------------------------------------------------------- */
 .presets-grid {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(235px, 1fr));
   gap: 10px;
+  max-height: 430px;
+  overflow-y: auto;
+  padding-right: 4px;
   margin-bottom: 20px;
+}
+
+.preset-group-heading {
+  grid-column: 1 / -1;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-top: 6px;
+  margin-bottom: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.preset-group-heading:first-child {
+  margin-top: 0;
 }
 
 .preset-card {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
+  gap: 10px;
   background: var(--bg-surface-elevated);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  padding: 14px;
+  padding: 12px;
   cursor: pointer;
   transition: all var(--transition-fast);
+  min-width: 0;
 }
 
 .preset-card:hover {
   border-color: var(--border-strong);
+  transform: translateY(-1px);
 }
 
 .preset-card.active {
   border-color: var(--accent-primary);
-  background: rgba(99, 102, 241, 0.05);
+  background: rgba(99, 102, 241, 0.08);
   box-shadow: 0 0 0 1px var(--accent-primary);
 }
 
@@ -844,23 +867,39 @@ body.studio-dark {
   background: var(--accent-primary);
 }
 
+.preset-content {
+  min-width: 0;
+  flex: 1;
+}
+
 .preset-name {
   font-weight: 600;
-  font-size: 0.95rem;
+  font-size: 0.88rem;
+  line-height: 1.25;
   margin-bottom: 4px;
 }
 
 .preset-desc {
-  font-size: 0.8rem;
+  font-size: 0.76rem;
   color: var(--text-muted);
-  line-height: 1.4;
+  line-height: 1.38;
   margin-bottom: 8px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .preset-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 5px;
+}
+
+.tag-accent {
+  background: rgba(216, 255, 43, 0.14);
+  color: #d8ff2b;
+  border-color: rgba(216, 255, 43, 0.35);
 }
 
 .tag {

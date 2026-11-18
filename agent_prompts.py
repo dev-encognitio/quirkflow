@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import html as _html
 import json
 import math
 import re
@@ -483,6 +484,47 @@ def format_words_for_edl(words_by_clip: dict[str, list[list[Any]]], max_chars: i
 # PROMPT BUILDERS
 # ============================================================================
 
+def _format_style_profile_block(preset: dict[str, Any] | None, stage: str = "script") -> str:
+    """Format the active preset's style_profile into concise stage-specific guidance."""
+    p = preset or {}
+    style = p.get("style_profile") or {}
+    if not style:
+        return ""
+
+    name = style.get("name") or p.get("name") or "Custom Style"
+    dur = style.get("target_duration_s", "")
+    asl = style.get("target_asl_s", "")
+    wpm = style.get("target_wpm", "")
+    hook = style.get("hook_formula", "")
+    lines = [
+        f"ACTIVE STYLE PRESET: {name} (id={p.get('id', 'custom')})",
+    ]
+    if dur or asl or wpm:
+        lines.append(f"- Benchmarks: duration={dur}s | avg_shot_length={asl}s | speaking_wpm={wpm}")
+    if hook:
+        lines.append(f"- Hook Formula: {hook}")
+
+    if stage in ("script", "critic"):
+        if style.get("script_directive"):
+            lines.append(f"- Script Direction: {style['script_directive']}")
+    elif stage == "edl":
+        if style.get("edl_directive"):
+            lines.append(f"- Cutting & Pacing Direction: {style['edl_directive']}")
+        hl = p.get("highlight_colors") or {}
+        if hl:
+            lines.append(f"- Preferred Caption Highlight Palette (ASS BGR): {json.dumps(hl)}")
+    elif stage in ("graphics", "revision"):
+        if style.get("graphics_mode"):
+            lines.append(f"- Graphics Mode: {style['graphics_mode']}")
+        if style.get("graphics_directive"):
+            lines.append(f"- Visual Motion Direction: {style['graphics_directive']}")
+    elif stage == "vision":
+        if style.get("vision_aesthetic"):
+            lines.append(f"- Target Visual Aesthetic: {style['vision_aesthetic']}")
+
+    return "\n" + "\n".join(lines) + "\n"
+
+
 def build_script_generation_prompt(
     transcript_text: str,
     guide_summary: str | None = None,
@@ -503,6 +545,7 @@ def build_script_generation_prompt(
         "- Format choice: A vs B comparison, 3-step framework, or counter-intuitive myth."
     )
 
+    style_block = _format_style_profile_block(p, stage="script")
     user_story_block = ""
     if story_prompt and story_prompt.strip():
         user_story_block = f"\nCREATOR'S STORY DIRECTION & FOCUS:\n{story_prompt.strip()}\n"
@@ -515,7 +558,7 @@ You are an elite short-form video editor and retention specialist producing a hi
 
 TASK:
 Review the complete transcript of raw recording clips below. Formulate THREE distinct, compelling script options (Option A, Option B, Option C).
-{user_story_block}{clip_block}
+{style_block}{user_story_block}{clip_block}
 RAW TRANSCRIPT:
 ```
 {transcript_text[:36000]}
@@ -539,9 +582,9 @@ REQUIREMENTS FOR EACH OPTION:
 4. viewer_question: The curiosity or skepticism the hook activates.
 5. turn: The surprising twist, counter-intuitive insight, or revelation.
 6. loop: How the ending phrase seamlessly connects back to the hook or re-contextualizes it.
-7. estimated_duration_s: Realistic spoken duration (typically 40s-120s matching selected clauses).
+7. estimated_duration_s: Realistic spoken duration aligned with the active preset benchmark.
 8. script_text: Complete spoken edit built cleanly from grounded clauses in the transcript.
-9. parts_hint: List of logical beat titles or parts.
+9. parts_hint: List of logical beat titles or parts matching the active style cadence.
 
 Return valid JSON conforming to the schema. Output JSON only."""
 
@@ -553,6 +596,7 @@ def build_script_critic_prompt(
 ) -> str:
     """Build the prompt for the adversarial cold-viewer critic pass."""
     options_json = json.dumps(script_options, indent=2)
+    style_block = _format_style_profile_block(preset, stage="critic")
     return f"""Do NOT read external files or run shell commands. Work strictly from the provided text and output valid JSON only.
 
 You are an adversarial short-form video viewer and algorithmic retention auditor.
@@ -560,8 +604,9 @@ You scroll TikTok, Reels, and YouTube Shorts with zero patience. You skip immedi
 - The first 2 seconds contain throat clearing, preamble, or generic statements.
 - Lines read like choppy stitched fragments, broken grammar, or missing clause lead-ins.
 - Words in `script_text` were invented and do NOT appear verbatim inside ORIGINAL SOURCE TRANSCRIPT.
+- Pacing, tone, or structure misses the selected style preset.
 - The ending fizzles out instead of delivering a clear turn and loop.
-
+{style_block}
 SCRIPTS UNDER REVIEW:
 {options_json}
 
@@ -572,9 +617,10 @@ ORIGINAL SOURCE TRANSCRIPT:
 
 AUDIT INSTRUCTIONS:
 1. Check every option for spoken coherence (read `script_text` aloud sentence-by-sentence) AND verify phrases exist in ORIGINAL SOURCE TRANSCRIPT.
-2. Identify weak hooks, broken transitions, dangling pronouns, or ungrounded wording in 'issues'.
-3. In 'revised_options', output perfected, tightened, 100% transcript-grounded versions of all 3 options with clean clause transitions and strong Triple Hooks.
-4. Set 'passes' to true only if all revised scripts read like fluent, natural speech with high retention hooks.
+2. Check adherence to the active style preset hook, duration, and tone.
+3. Identify weak hooks, broken transitions, dangling pronouns, or ungrounded wording in 'issues'.
+4. In 'revised_options', output perfected, tightened, 100% transcript-grounded versions of all 3 options with clean clause transitions and strong hooks.
+5. Set 'passes' to true only if all revised scripts read like fluent, natural speech with high retention hooks.
 
 Return valid JSON conforming to the critic schema. Output JSON only."""
 
@@ -588,11 +634,12 @@ def build_edl_prompt(
 ) -> str:
     """Build the prompt for generating the Edit Decision List (EDL) and config."""
     script_str = json.dumps(selected_script, indent=2)
+    style_block = _format_style_profile_block(preset, stage="edl")
     clip_block = f"\nSOURCE CLIP INFO:\n{clip_summary}\n" if clip_summary else ""
     return f"""Do NOT read external files or run shell commands. Work strictly from the provided inputs and output valid JSON only.
 
-You are a precision video assembly engineer. Build an exact Edit Decision List (edl.json) matching the approved script.
-
+You are a precision video assembly engineer. Build an exact Edit Decision List (edl.json) matching the approved script and active style preset.
+{style_block}
 APPROVED SCRIPT:
 {script_str}
 {clip_block}
@@ -603,7 +650,7 @@ CLIP TRANSCRIPTS & WORD TIMESTAMPS:
 
 EDL REQUIREMENTS:
 1. 'title': Catchy 3-6 word hook title.
-2. 'highlight': Dict mapping 4-6 meaningful lowercase single keywords from 'say' to ASS BGR hex colors (NOTE ASS uses &HBBGGRR& order! E.g. coral/orange='&H3D8AFF&', lime='&H60F5C8&', cyan='&HFFD400&', pink='&HFFA04F&', gold='&H4FD5FF&'). Keys MUST be lowercase stripped words matching captions!
+2. 'highlight': Dict mapping 4-6 meaningful lowercase single keywords from 'say' to ASS BGR hex colors (NOTE ASS uses &HBBGGRR& order! E.g. chartreuse='#D8FF2B' -> '&H2BFFD8&', coral/orange='&H3D8AFF&', lime='&H60F5C8&', cyan='&HFFD400&', gold='&H00B8FF&'). Prefer the active style preset's preferred highlight palette when provided. Keys MUST be lowercase stripped words matching captions!
 3. 'names': Dict of lowercase/misheard words or proper nouns to fix in captions (e.g., '{{"christian": "Christian"}}').
 4. 'parts': Ordered cut segments:
    - 'id': 'p01', 'p02', ...
@@ -612,12 +659,12 @@ EDL REQUIREMENTS:
    - 'say': EXACT verbatim words spoken in that source range.
    - 'hold': Float tail hold (0.0 to 0.15).
    - 'beat': 'hook' | 'setup' | 'twist' | 'climax' | 'loop'.
-   - 'note': Specific visual motion-graphic cue idea for this beat (what hand-drawn SVG diagram/object/text should animate in the safe band!).
+   - 'note': Specific visual motion-graphic cue idea for this beat matching the active style's graphics mode (e.g., chalk diagram, spotlight news card phrase to highlight, checklist rows, quote card, or countdown metric).
 
 CRITICAL ASSEMBLY & COHERENCE RULES:
-- Prefer longer natural continuous takes (at least 2.5s-15s per part when available; typically 5-12 cohesive parts for ~45-60s) instead of tiny 1s fragments.
+- Match the cutting rhythm / average shot length requested by the active style preset while preserving fluent spoken clause joins.
 - Every cut transition `p[i].say` -> `p[i+1].say` MUST form fluent, grammatical spoken English when read straight through! Always include clause lead-ins ("because...", "and when...", "so...") inside the part so joins never sound like chopped word salad.
-- Avoid gratuitous clip ping-ponging (e.g., switching c03 <-> c01 every 2 seconds) or jumping to takes with different framing/glasses mid-thought unless starting a deliberate distinct beat.
+- Avoid gratuitous clip ping-ponging mid-thought unless starting a deliberate distinct beat.
 - Never let consecutive chronological parts on the same clip overlap in source time.
 - Ensure 'say' matches verbatim words inside 'range' so word-level matching scores >= 0.90.
 
@@ -651,7 +698,7 @@ def render_hyperframes_index_html(
     scenes_js: str,
     total_dur: float,
 ) -> str:
-    """Wrap LLM-generated or fallback GSAP/SVG `scenes_js` in the battle-tested HyperFrames chalk scaffold."""
+    """Wrap LLM-generated or fallback GSAP/SVG `scenes_js` in the HyperFrames composition scaffold."""
     p = preset or {}
     w = int(p.get("width", 1080))
     h = int(p.get("height", 1920))
@@ -666,6 +713,7 @@ def render_hyperframes_index_html(
     title_size = 56 if h >= w else 54
     cv_size = 50 if h >= w else 46
     clean_scenes = (scenes_js or "").strip()
+    scrim_h = max(200, g_bot - g_top)
 
     return f"""<!doctype html><html lang="en"><head><meta charset="UTF-8"/>
 <meta name="viewport" content="width={w}, height={h}"/>
@@ -682,6 +730,24 @@ html,body{{margin:0;width:{w}px;height:{h}px;overflow:hidden;background:transpar
 .ln{{fill:none;stroke-linecap:round;stroke-linejoin:round}}
 .hw{{position:absolute;opacity:0;white-space:nowrap;color:#F4EFE6;font:400 {title_size}px/1.1 'Marker',cursive;text-shadow:0 3px 0 rgba(0,0,0,.5),0 6px 16px rgba(0,0,0,.65)}}
 .cv{{font:700 {cv_size}px/1.1 'Caveat',cursive}}
+.scrim{{position:absolute;left:0;top:{g_top}px;width:{w}px;height:{scrim_h}px;opacity:0;background:radial-gradient(ellipse at center,rgba(10,12,18,.68) 0%,rgba(6,8,14,.86) 100%);pointer-events:none}}
+.ecard{{position:absolute;opacity:0;background:#F8FAFC;color:#0F172A;border-radius:22px;padding:24px 28px;border:2px solid rgba(15,23,42,.12);box-shadow:0 18px 42px rgba(0,0,0,.55);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
+.ecard.ecard-dark{{background:rgba(12,16,26,.92);color:#F8FAFC;border-color:rgba(255,255,255,.16)}}
+.ebadge{{display:inline-block;padding:4px 14px;border-radius:8px;background:#B91C1C;color:#FFFFFF;font-size:28px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;margin-bottom:10px}}
+.ehead{{font-size:38px;font-weight:800;line-height:1.18;color:#0B0F19;margin-bottom:10px}}
+.ecard-dark .ehead{{color:#F8FAFC}}
+.ebody{{font-size:30px;font-weight:500;line-height:1.34;color:#334155}}
+.ecard-dark .ebody{{color:#CBD5E1}}
+.hlm{{position:relative;display:inline-block;padding:0 8px;border-radius:6px;isolation:isolate;color:#0B0F19}}
+.hlm-bg{{position:absolute;left:0;top:4%;width:100%;height:92%;background:#D8FF2B;border-radius:6px;transform:scaleX(0);transform-origin:left center;z-index:0}}
+.hlm-txt{{position:relative;z-index:1}}
+.hpill{{position:absolute;opacity:0;background:rgba(13,17,26,.9);color:#F8FAFC;border:1.5px solid rgba(255,255,255,.18);border-radius:16px;padding:16px 22px;box-shadow:0 12px 28px rgba(0,0,0,.5);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
+.prow{{display:flex;align-items:center;gap:10px;font-size:30px;font-weight:700;line-height:1.28;margin:4px 0}}
+.pchk{{color:#4ADE80;font-weight:900}}
+.qbox{{position:absolute;opacity:0;background:#F8FAFC;color:#0A0A0C;border-radius:14px;padding:28px 34px;box-shadow:0 20px 48px rgba(0,0,0,.6);font-family:Georgia,'Times New Roman',serif;text-align:center}}
+.qbox.qbox-dark{{background:#0B0C10;color:#F8FAFC;border:1.5px solid rgba(255,255,255,.22)}}
+.qt{{font-size:46px;font-weight:700;line-height:1.18}}
+.qs{{font-family:-apple-system,sans-serif;font-size:28px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.78;margin-top:12px}}
 </style></head><body>
 <div id="root" data-composition-id="main" data-start="0" data-duration="{total_dur:.2f}" data-width="{w}" data-height="{h}" data-fps="{fps}">
 <svg width="0" height="0" style="position:absolute">
@@ -703,7 +769,13 @@ const pl=(d,w,c)=>`<path class="ln" d="${{d}}" stroke="${{c||W}}" stroke-width="
 const dl=(d,w,c)=>{{const id="mk"+(MK++);return `<mask id="${{id}}" maskUnits="userSpaceOnUse" x="-3000" y="-3000" width="7000" height="7000"><path class="mk" d="${{d}}" stroke="#fff" stroke-width="40" pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"/></mask>`+
  `<path class="ln" d="${{d}}" stroke="${{c||L}}" stroke-width="${{w}}" stroke-dasharray="0.1 15" mask="url(#${{id}})"/>`;}};
 function draw(id,inner,filt){{add(`<div id="${{id}}" class="g"><svg width="{w}" height="{h}"><g filter="url(#${{filt||"chalk"}})">${{inner}}</g></svg></div>`);}}
-function label(id,html,x,y,o){{o=o||{{}};add(`<div id="${{id}}" class="hw${{o.cv?" cv":""}}" data-layout-allow-safe-zone style="left:${{x}}px;top:${{y}}px;${{o.w?`width:${{o.w}}px;text-align:center;white-space:normal;`:""}}font-size:${{o.size||(o.cv?{cv_size}:{title_size})}}px;${{o.col?`color:${{o.col}};`:""}}">${{html}}</div>`);}}
+function label(id,html,x,y,o){{o=o||{{}};add(`<div id="${{id}}" class="hw${{o.cv?" cv":""}}" data-layout-allow-safe-zone style="left:${{x}}px;top:${{y}}px;${{o.vis?"opacity:1;":""}}${{o.w?`width:${{o.w}}px;text-align:center;white-space:normal;`:""}}font-size:${{o.size||(o.cv?{cv_size}:{title_size})}}px;${{o.col?`color:${{o.col}};`:""}}">${{html}}</div>`);}}
+const hl=(txt,col)=>`<span class="hlm"><span class="hlm-bg"${{col?` style="background:${{col}}"`:""}}></span><span class="hlm-txt">${{txt}}</span></span>`;
+function scrim(id,t0,t1,op){{stage.insertAdjacentHTML("afterbegin",`<div id="${{id}}" class="scrim" data-layout-allow-safe-zone></div>`);const el=document.getElementById(id);tl.fromTo(el,{{opacity:0}},{{opacity:op||.72,duration:.24,ease:"power2.out",immediateRender:false}},t0);tl.to(el,{{opacity:0,duration:.24,ease:"power2.in",immediateRender:false}},Math.max(t0+.35,t1-.24));}}
+function card(id,badge,headHtml,bodyHtml,x,y,o){{o=o||{{}};add(`<div id="${{id}}" class="ecard${{o.dark?" ecard-dark":""}}" data-layout-allow-safe-zone style="left:${{x}}px;top:${{y}}px;width:${{o.w||840}}px;${{o.vis?"opacity:1;":""}}">${{badge?`<div class="ebadge"${{o.bcol?` style="background:${{o.bcol}}"`:""}}>${{badge}}</div>`:""}}${{headHtml?`<div class="ehead">${{headHtml}}</div>`:""}}${{bodyHtml?`<div class="ebody">${{bodyHtml}}</div>`:""}}</div>`);}}
+function mark(id,t,dur){{const el=document.getElementById(id);const bgs=el?el.querySelectorAll(".hlm-bg"):[];if(bgs.length)tl.to(bgs,{{scaleX:1,duration:dur||.36,ease:"power2.out",stagger:.16}},t);}}
+function pill(id,rowsHtml,x,y,o){{o=o||{{}};add(`<div id="${{id}}" class="hpill" data-layout-allow-safe-zone style="left:${{x}}px;top:${{y}}px;${{o.vis?"opacity:1;":""}}${{o.w?`width:${{o.w}}px;`:""}}">${{rowsHtml}}</div>`);}}
+function quoteBox(id,titleHtml,subHtml,x,y,o){{o=o||{{}};add(`<div id="${{id}}" class="qbox${{o.dark?" qbox-dark":""}}" data-layout-allow-safe-zone style="left:${{x}}px;top:${{y}}px;width:${{o.w||820}}px;${{o.vis?"opacity:1;":""}}"><div class="qt">${{titleHtml}}</div>${{subHtml?`<div class="qs">${{subHtml}}</div>`:""}}</div>`);}}
 const G=(x,y,s,inner)=>`<g transform="translate(${{x}},${{y}}) scale(${{s}})">${{inner}}</g>`;
 const tl=gsap.timeline({{paused:true}});
 const X=end=>Math.max(0,end-.28);
@@ -728,10 +800,12 @@ def build_fallback_scenes_js(
     edl_json: dict[str, Any],
     preset: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
-    """Build deterministic animated cue-synced chalk graphics fallback so #stage is never blank."""
+    """Build deterministic style-adapted cue-synced graphics fallback so #stage matches the preset."""
     p = preset or {}
     w = int(p.get("width", 1080))
     h = int(p.get("height", 1920))
+    style = p.get("style_profile") or {}
+    g_mode = str(style.get("graphics_mode") or "hand_drawn")
     g_band = p.get("graphics_band", {})
     g_top = int(g_band.get("top", 1140 if h >= w else 80))
     g_bot = int(g_band.get("bottom", 1500 if h >= w else 860))
@@ -742,29 +816,53 @@ def build_fallback_scenes_js(
     safe_right = 850 if h >= w else w - 90
     label_w = max(320, safe_right - 90)
     cx = (90 + safe_right) // 2
-    y_title = g_top + 48
-    y_sub = min(g_bot - 90, y_title + 92)
-    bx0, bx1 = max(80, cx - 340), min(safe_right, cx + 340)
-    by0, by1 = g_top + 28, min(g_bot - 28, y_title + 170)
+    card_w = min(840, w - 220)
+    card_x = (w - card_w) // 2
+    lower_y = max(g_top + 28, min(g_bot - 220, 1140 if h >= w else g_bot - 240))
+    mid_card_y = (g_top + min(g_bot - 260, 920)) // 2 if (g_bot - g_top) > 500 else lower_y
 
     cues_json: dict[str, Any] = {
         "total": round(total, 2),
         "title": title,
+        "graphics_mode": g_mode,
         "beats": [],
     }
-    js_lines = [
-        f"const TITLE = {json.dumps(title)};",
-        f'draw("fbFrame", pl("M{bx0} {by0 + 18} L{bx0} {by0} L{bx0 + 36} {by0} M{bx1 - 36} {by0} L{bx1} {by0} L{bx1} {by0 + 18} M{bx0} {by1 - 18} L{bx0} {by1} L{bx0 + 36} {by1} M{bx1 - 36} {by1} L{bx1} {by1} L{bx1} {by1 - 18}", 7, T));',
-        f'label("fbTitle", TITLE, 90, {y_title}, {{w: {label_w}, size: 52, col: W}});',
-        'tl.set("#fbFrame,#fbTitle", {opacity: 1}, 0);',
-        'tl.set("#fbFrame .ln[pathLength]", {strokeDashoffset: 0}, 0);',
-    ]
 
-    # Group beats chronologically cleanly (non-overlapping card swaps across the safe band)
     last_end = min(3.2, total)
-    if last_end > 2.2:
-        js_lines.append(f'pulse("#fbTitle", "{cx}px {y_title + 28}px", {min(1.5, last_end - 0.8):.2f}, 1.05);')
-    js_lines.append(f'out("#fbFrame,#fbTitle", {max(0.4, last_end - 0.3):.2f});')
+    if g_mode == "news_card":
+        js_lines = [
+            f"const TITLE = {json.dumps(title)};",
+            f'card("fbHookCard", "STORY", TITLE, "", {card_x}, {lower_y}, {{w: {card_w}, vis: 1, bcol: "#B91C1C"}});',
+            'tl.set("#fbHookCard", {opacity: 1}, 0);',
+        ]
+        if last_end > 2.2:
+            js_lines.append(f'tl.to("#fbHookCard", {{y: -6, duration: 0.8, ease: "sine.inOut"}}, {min(1.5, last_end - 0.8):.2f});')
+        js_lines.append(f'out("#fbHookCard", {max(0.4, last_end - 0.3):.2f});')
+    elif g_mode == "monochrome_essay":
+        js_lines = [
+            f"const TITLE = {json.dumps(title)};",
+            f'quoteBox("fbHookQ", TITLE, "THESIS", {card_x}, {lower_y - 10}, {{w: {card_w}, dark: 1, vis: 1}});',
+            'tl.set("#fbHookQ", {opacity: 1}, 0);',
+        ]
+        if last_end > 2.2:
+            js_lines.append(f'tl.to("#fbHookQ", {{y: -6, duration: 0.8, ease: "sine.inOut"}}, {min(1.5, last_end - 0.8):.2f});')
+        js_lines.append(f'out("#fbHookQ", {max(0.4, last_end - 0.3):.2f});')
+    else:
+        y_title = lower_y + 20
+        bx0, bx1 = max(80, cx - 340), min(safe_right, cx + 340)
+        by0, by1 = lower_y, min(g_bot - 28, y_title + 170)
+        js_lines = [
+            f"const TITLE = {json.dumps(title)};",
+            f'draw("fbFrame", pl("M{bx0} {by0 + 18} L{bx0} {by0} L{bx0 + 36} {by0} M{bx1 - 36} {by0} L{bx1} {by0} L{bx1} {by0 + 18} M{bx0} {by1 - 18} L{bx0} {by1} L{bx0 + 36} {by1} M{bx1 - 36} {by1} L{bx1} {by1} L{bx1} {by1 - 18}", 7, T));',
+            f'label("fbTitle", TITLE, 90, {y_title}, {{w: {label_w}, size: 52, col: W, vis: 1}});',
+            'tl.set("#fbFrame,#fbTitle", {opacity: 1}, 0);',
+            'tl.set("#fbFrame .ln[pathLength]", {strokeDashoffset: 0}, 0);',
+        ]
+        if last_end > 2.2:
+            js_lines.append(f'tl.to("#fbFrame", {{y: -4, duration: 0.8, ease: "sine.inOut"}}, {min(1.5, last_end - 0.8):.2f});')
+        js_lines.append(f'out("#fbFrame,#fbTitle", {max(0.4, last_end - 0.3):.2f});')
+
+    # Group beats chronologically cleanly (non-overlapping across the safe band)
     for idx, b in enumerate(beats[:10]):
         s = max(last_end if idx > 0 else 0.0, float(b["start"]))
         e = min(total, float(b["end"]))
@@ -776,7 +874,6 @@ def build_fallback_scenes_js(
         if e - s < 1.2:
             continue
         cue_text = b["note"] or b["say"][:48]
-        # Clean prefix like "Setup: "
         if ":" in cue_text:
             cue_text = cue_text.split(":", 1)[-1].strip()
         cue_text = cue_text[:44].strip()
@@ -784,18 +881,60 @@ def build_fallback_scenes_js(
             continue
         bid = f"beat{idx}"
         lid = f"lbl{idx}"
-        col_var = "T" if idx % 2 == 0 else "L"
         cues_json["beats"].append({"id": bid, "start": round(s, 2), "end": round(e, 2), "text": cue_text})
-        js_lines.extend([
-            f'draw("{bid}", pl("M{cx - 240} {y_sub + 58} Q{cx} {y_sub + 44} {cx + 240} {y_sub + 58}", 7, {col_var}));',
-            f'label("{lid}", {json.dumps(cue_text)}, 90, {y_title + 26}, {{cv: 1, w: {label_w}, size: 52, col: {col_var}}});',
-            f'strokes("{bid}", {s:.2f}, 0.45);',
-            f'lin("{lid}", {s + 0.08:.2f}, 0.38);',
-        ])
-        if e - s > 2.2:
-            mid_t = round((s + e) / 2.0, 2)
-            js_lines.append(f'pulse("#{lid}", "{cx}px {y_title + 52}px", {mid_t:.2f}, 1.06);')
-        js_lines.append(f'out("#{bid},#{lid}", {max(s + 0.5, e - 0.28):.2f});')
+
+        if g_mode == "news_card":
+            scrim_id = f"scrim{idx}"
+            if idx % 2 == 1 and (g_bot - g_top) > 500:
+                js_lines.extend([
+                    f'scrim("{scrim_id}", {s:.2f}, {e:.2f}, 0.72);',
+                    f'card("{lid}", "REPORT", hl({json.dumps(cue_text)}), "", {card_x}, {mid_card_y}, {{w: {card_w}, bcol: "#B91C1C"}});',
+                    f'pop("{lid}", {s + 0.08:.2f}, "50% 50%");',
+                    f'mark("{lid}", {s + 0.45:.2f}, 0.42);',
+                    f'out("#{lid}", {max(s + 0.6, e - 0.28):.2f});',
+                ])
+            else:
+                js_lines.extend([
+                    f'card("{lid}", "FACT", {json.dumps(cue_text)}, "", {card_x}, {lower_y}, {{w: {card_w}, dark: 1, bcol: "#1D4ED8"}});',
+                    f'lin("{lid}", {s:.2f}, 0.32);',
+                ])
+                if e - s > 2.2:
+                    js_lines.append(f'tl.to("#{lid}", {{y: -6, duration: 0.7, ease: "sine.inOut"}}, {round((s + e) / 2.0, 2):.2f});')
+                js_lines.append(f'out("#{lid}", {max(s + 0.5, e - 0.28):.2f});')
+        elif g_mode == "monochrome_essay":
+            dark_flag = 0 if idx % 2 == 1 else 1
+            qy = mid_card_y if dark_flag == 0 else lower_y
+            js_lines.extend([
+                f'quoteBox("{lid}", {json.dumps(cue_text)}, "IDEA", {card_x}, {qy}, {{w: {card_w}, dark: {dark_flag}}});',
+                f'lin("{lid}", {s:.2f}, 0.34);',
+            ])
+            if e - s > 2.2:
+                js_lines.append(f'tl.to("#{lid}", {{y: -6, duration: 0.7, ease: "sine.inOut"}}, {round((s + e) / 2.0, 2):.2f});')
+            js_lines.append(f'out("#{lid}", {max(s + 0.5, e - 0.28):.2f});')
+        elif g_mode in ("motion_pills", "spatial_proof", "experiment_data", "countdown_collage", "split_ui"):
+            badge_tag = f"{idx:02d}" if g_mode != "countdown_collage" else f"00:{max(0, 25 - idx * 3):02d}"
+            row_html = f'<div class="prow"><span class="pchk">✓</span><span>{_html.escape(badge_tag)} · {_html.escape(cue_text)}</span></div>'
+            js_lines.extend([
+                f'pill("{lid}", {json.dumps(row_html)}, {card_x}, {lower_y + 20}, {{w: {card_w}}});',
+                f'lin("{lid}", {s:.2f}, 0.32);',
+            ])
+            if e - s > 2.2:
+                js_lines.append(f'tl.to("#{lid}", {{y: -6, duration: 0.7, ease: "sine.inOut"}}, {round((s + e) / 2.0, 2):.2f});')
+            js_lines.append(f'out("#{lid}", {max(s + 0.5, e - 0.28):.2f});')
+        else:
+            col_var = "T" if idx % 2 == 0 else "L"
+            y_title = lower_y + 20
+            y_sub = min(g_bot - 90, y_title + 92)
+            js_lines.extend([
+                f'draw("{bid}", pl("M{cx - 240} {y_sub + 58} Q{cx} {y_sub + 44} {cx + 240} {y_sub + 58}", 7, {col_var}));',
+                f'label("{lid}", {json.dumps(cue_text)}, 90, {y_title + 26}, {{cv: 1, w: {label_w}, size: 52, col: {col_var}}});',
+                f'strokes("{bid}", {s:.2f}, 0.45);',
+                f'lin("{lid}", {s + 0.08:.2f}, 0.38);',
+            ])
+            if e - s > 2.2:
+                mid_t = round((s + e) / 2.0, 2)
+                js_lines.append(f'pulse("#{lid}", "{cx}px {y_title + 52}px", {mid_t:.2f}, 1.06);')
+            js_lines.append(f'out("#{bid},#{lid}", {max(s + 0.5, e - 0.28):.2f});')
         last_end = e
 
     return cues_json, "\n".join(js_lines)
@@ -807,7 +946,7 @@ def build_hyperframes_prompt(
     preset: dict[str, Any] | None = None,
     word_cues_text: str = "",
 ) -> str:
-    """Build a concise, focused prompt returning cues_json + scenes_js for our HyperFrames chalk scaffold."""
+    """Build a focused prompt returning cues_json + scenes_js tailored to the active preset style."""
     p = preset or {}
     w = int(p.get("width", 1080))
     h = int(p.get("height", 1920))
@@ -820,6 +959,7 @@ def build_hyperframes_prompt(
     safe_y_bot = min(g_bot - 40, 1440 if h >= w else g_bot)
     c_band = p.get("caption_band", {"top": 1500, "bottom": 1640})
 
+    style_block = _format_style_profile_block(p, stage="graphics")
     beats = _extract_hyperframes_beats(timeline_json, edl_json)
     beats_str = json.dumps(beats, indent=2)
     title = str((edl_json or {}).get("title") or "Motion Graphics").strip()
@@ -827,35 +967,40 @@ def build_hyperframes_prompt(
 
     return f"""Do NOT read external workspace files, do NOT read skills, and do NOT run shell commands. All required inputs and helper APIs are provided below. Output JSON only.
 
-You are designing hand-drawn sketchy chalkboard motion graphics for a {w}x{h} @ {fps}fps video ({total_dur:.2f}s total).
+You are designing timeline-synced motion graphics for a {w}x{h} @ {fps}fps video ({total_dur:.2f}s total).
 Video Title: {json.dumps(title)}
-
+{style_block}
 STAGE BOUNDS & PALETTE:
-- Graphics safe band: x=80..{safe_right}, y={g_top}..{safe_y_bot}. Keep EVERY SVG stroke and HTML label strictly inside this box!
+- Graphics safe band: x=80..{safe_right}, y={g_top}..{safe_y_bot}. Keep EVERY SVG stroke, card, pill, and HTML label strictly inside this box!
 - Caption keep-out zone: y={c_band.get('top', 1500)}..{c_band.get('bottom', 1640)} (NOTHING may extend into captions).
 - Already-defined JS palette constants: W="#F4EFE6" (warm chalk white), L="#C8F560" (dotted/highlight lime), T="#FF8A3D" (accent orange).
-- Do NOT put colored rectangles/boxes, opaque cards, or drop-shadow backgrounds behind illustrations; use clean hand-drawn SVG outlines, arrows, figures, props, and handwritten labels (`Marker` / `Caveat`).
+- If the active style specifies `hand_drawn` / `step_counters` / `wide_diagram`, use sketchy SVG props + handwritten labels (`Marker` / `Caveat`) with ZERO rectangular backgrounds. If it specifies `news_card`, `split_ui`, `motion_pills`, `spatial_proof`, `monochrome_essay`, `experiment_data`, or `countdown_collage`, combine SVGs with the editorial card/scrim/highlighter/pill/quote helpers below as directed!
 
 ALREADY-SCAFFOLDED JS HELPERS YOU MUST CALL IN `scenes_js`:
-- `#stage`, `tl` (paused GSAP timeline), `C` (`window.CUES`), `W`, `L`, `T` are already initialized. DO NOT redeclare `tl`, `C`, `W`, `L`, `T`, `pl`, `dl`, `draw`, `label`, `G`, or HTML `<head>` tags!
-- `pl(pathD, strokeWidth, color)` -> sketchy double-pass chalk SVG stroke (`pathLength="1"`).
-- `dl(pathD, strokeWidth, color)` -> masked dotted lime/chalk SVG line (`.mk` inside `<mask>`).
-- `draw(id, svgMarkup, filterName)` -> mounts `<div id="{{id}}" class="g">` containing an SVG (`filterName`: `"chalk"` default or `"wob"`).
-- `label(id, htmlText, x, y, opts)` -> adds `.hw` text at `(x, y)` inside `x=80..{safe_right}, y={g_top}..{safe_y_bot}` (`opts`: `{{cv:1, size:52, w:400, col:T}}`). Note: Do NOT pass `rot` CSS transform on targets animated by GSAP! Keep all transforms inside GSAP (`rotation`, `x`, `y`, `scale`).
-- `G(x, y, scale, innerSvg)` -> groups `<g transform="translate(x,y) scale(scale)">`.
+- `#stage`, `tl` (paused GSAP timeline), `C` (`window.CUES`), `W`, `L`, `T` are already initialized. DO NOT redeclare `tl`, `C`, `W`, `L`, `T`, `pl`, `dl`, `draw`, `label`, `card`, `scrim`, `mark`, `hl`, `pill`, `quoteBox`, `G`, or HTML `<head>` tags!
+- NEVER write template literals inside `querySelectorAll(...)`; use `document.getElementById(id)` or helper functions directly.
+- Sketchy SVG & Handwriting Helpers:
+  - `pl(pathD, strokeWidth, color)` -> double-pass chalk SVG stroke (`pathLength="1"`).
+  - `dl(pathD, strokeWidth, color)` -> masked dotted SVG line (`.mk` inside `<mask>`).
+  - `draw(id, svgMarkup, filterName)` -> mounts `<div id="{{id}}" class="g">` containing an SVG (`filterName`: `"chalk"` default or `"wob"`).
+  - `label(id, htmlText, x, y, opts)` -> adds `.hw` text at `(x, y)` inside `x=80..{safe_right}, y={g_top}..{safe_y_bot}` (`opts`: `{{cv:1, size:52, w:400, col:T}}`). Note: Do NOT pass CSS transforms on targets animated by GSAP.
+  - `G(x, y, scale, innerSvg)` -> groups `<g transform="translate(x,y) scale(scale)">`.
+- Editorial Card / Masking / Highlighter Helpers:
+  - `scrim(id, t0, t1, op)` -> fades a darkened spotlight scrim over `y={g_top}..{g_bot}` from `t0` to `t1` (`op`: ~0.72).
+  - `hl(text, color)` -> returns `<span class="hlm">...</span>` for animated neon highlighter wipes (`#D8FF2B` default).
+  - `card(id, badgeText, headHtml, bodyHtml, x, y, opts)` -> mounts rounded white/dark `.ecard` (`opts`: `{{w:840, dark:1, bcol:"#DC2626"}}`). Call `mark(id, t, dur)` right after `pop(id, ...)` to sweep all `hl(...)` highlights inside that card!
+  - `pill(id, rowsHtml, x, y, opts)` -> mounts translucent frosted dark stack/checklist/counter pill (`<div class="prow"><span class="pchk">✓</span><span>...</span></div>`).
+  - `quoteBox(id, titleHtml, subHtml, x, y, opts)` -> mounts clean monochrome/white serif thesis card (`opts`: `{{w:820, dark:1}}`).
 - Timeline helpers:
-  - `strokes(id, t, dur, stagger)` -> animates `#id` solid `pl()` strokes drawing in at `t`s.
-  - `dots(id, t, dur, stagger)` -> animates `#id` dotted `dl()` lines drawing in at `t`s (wait: keep `dots` start after/separate cleanly, zero conflicting `.mk` tweens).
-  - `lin(id, t, dur)` -> wipes text label left-to-right at `t`s.
-  - `pop(id, t, transformOrigin)` -> crisp impact stamp pop-in at `t`s (works on labels or SVGs).
-  - `pulse(sel, transformOrigin, t, scale)` / `shake(sel, t, amp, n)` / `swap(a, b, t)`.
+  - `strokes(id, t, dur, stagger)` / `dots(id, t, dur, stagger)` / `lin(id, t, dur)` / `pop(id, t, transformOrigin)`
+  - `pulse(sel, transformOrigin, t, scale)` / `shake(sel, t, amp, n)` / `swap(a, b, t)`
   - `out(selector, t, dy)` -> fades & drops elements cleanly out BEFORE next beat starts!
 
 CHOREOGRAPHY REQUIREMENTS:
-1. Frame 0 visibility: Ensure the opening hook title/icon is ALREADY visibly drawn at `t=0` (`tl.set("#hookId", {{opacity:1}}, 0); tl.set("#hookId .ln[pathLength]", {{strokeDashoffset:0}}, 0);`) so frame 0 is never blank (`first_frame_empty`).
-2. Bespoke visual metaphors per beat: For EACH narrative beat (`hook`, `setup`, `twist`, `climax`, `loop`), draw recognizable simple props matching that beat's `say` & `note` (e.g., pizza slice, masks, scales, arrows, figures, checkmarks, comparison diagrams — never blank screens or single static text!).
-3. Continuous motion (`dead_stretch` guard): Never leave >2.5s without visual change! For any beat >= 2.6s long, schedule a mid-beat `pulse(...)`, `dots(...)`, or secondary `lin(...)` halfway through before `out(...)`.
-4. Strict non-overlap cleanup: Call `out("#prevIds...", endTime - 0.28)` before the next beat arrives so elements never stack on top of old elements.
+1. Frame 0 visibility: Ensure the opening hook element is ALREADY visibly drawn at `t=0` (`tl.set("#hookId", {{opacity:1}}, 0);` and `strokeDashoffset:0` if SVG) so frame 0 is never blank (`first_frame_empty`).
+2. Bespoke visual metaphors per beat: Match each beat's `say` & `note` using the active style preset grammar.
+3. Continuous motion (`dead_stretch` guard): Never leave >2.5s without visual change! Schedule a mid-beat `pulse(...)`, `mark(...)`, `dots(...)`, or secondary `lin(...)` before `out(...)`.
+4. Strict non-overlap cleanup: Call `out("#prevIds...", endTime - 0.28)` before the next beat arrives.
 5. Keep `scenes_js` clean, bug-free ES6 JS (around 45-130 lines total, zero syntax errors).
 
 MERGED TIMELINE BEATS & VISUAL NOTES:
@@ -863,7 +1008,7 @@ MERGED TIMELINE BEATS & VISUAL NOTES:
 {word_cues_block}
 OUTPUT JSON SCHEMA:
 - `cues_json`: object containing `"total": {total_dur:.2f}` plus named timestamp objects for each beat.
-- `scenes_js`: JavaScript body calling `draw(...)`, `label(...)`, `strokes(...)`, `dots(...)`, `lin(...)`, `pop(...)`, `out(...)` referenced cleanly against `C.*` cues.
+- `scenes_js`: JavaScript body referencing `C.*` cues.
 
 Output valid JSON with keys `cues_json` and `scenes_js`. Output JSON only."""
 
@@ -884,12 +1029,13 @@ def build_hyperframes_revision_prompt(
     g_band = p.get("graphics_band", {"top": 1140 if h >= w else 80, "bottom": 1500 if h >= w else 860})
     safe_right = 980 if h >= w else w - 80
     safe_y_bot = min(int(g_band.get("bottom", 1500)), 1440 if h >= w else int(g_band.get("bottom", 860)))
+    style_block = _format_style_profile_block(p, stage="revision")
     beats = _extract_hyperframes_beats(timeline_json, edl_json)
     return f"""Do NOT read external workspace files or run shell commands. Output JSON only.
 
 The Vision Art Director / HyperFrames DOM audit REJECTED the current motion graphics for failing QA checks.
 Fix ALL reported issues and return updated `cues_json` + `scenes_js`.
-
+{style_block}
 REPORTED ISSUES:
 {json.dumps(issues, indent=2)}
 
@@ -898,9 +1044,10 @@ REQUIRED FIXES:
 
 LAYOUT & CONSTRAINTS:
 - Safe graphics band: x=80..{safe_right}, y={g_band.get('top', 1140)}..{safe_y_bot}.
-- Key hook element must already be visible at t=0 (`tl.set(..., {{opacity:1}}, 0)` + `strokeDashoffset:0`).
-- No static stretch >2.5s: add a mid-beat `pulse(...)`/`dots(...)` inside long beats.
-- Every beat must animate visibly inside `#stage` using `draw`, `label`, `pl`, `dl`, `strokes`, `lin`, `pop`, `out` (`W`, `L`, `T`, `tl`, `C` already defined).
+- Key hook element must already be visible at t=0 (`tl.set(..., {{opacity:1}}, 0)` + `strokeDashoffset:0` for SVG).
+- No static stretch >2.5s: add a mid-beat `pulse(...)`/`mark(...)`/`dots(...)` inside long beats.
+- NEVER use template literals inside `querySelectorAll(...)`.
+- Every beat must animate visibly inside `#stage` using existing helpers (`draw`, `label`, `card`, `scrim`, `mark`, `hl`, `pill`, `quoteBox`, `pl`, `dl`, `strokes`, `lin`, `pop`, `out`; `W`, `L`, `T`, `tl`, `C` already defined).
 
 TIMELINE BEATS:
 {json.dumps(beats, indent=2)}
@@ -954,6 +1101,11 @@ def build_vision_critique_prompt(
     g_bot = p.get("graphics_band", {}).get("bottom", 1500)
     c_top = p.get("caption_band", {}).get("top", 1500)
     c_bot = p.get("caption_band", {}).get("bottom", 1640)
+    style_block = _format_style_profile_block(p, stage="vision")
+    vision_aesthetic = (p.get("style_profile") or {}).get(
+        "vision_aesthetic",
+        "Hand-drawn sketchy chalk aesthetic (#F4EFE6 warm white, #FF8A3D warm accent, #C8F560 lime).",
+    )
 
     tel_block = f"\nPRE-COMPUTED KEYFRAME ALPHA/BBOX TELEMETRY:\n{telemetry_text}\n" if telemetry_text else ""
     beats_block = f"\nSCHEDULED BEATS:\n{beats_summary}\n" if beats_summary else ""
@@ -964,17 +1116,17 @@ def build_vision_critique_prompt(
 You are a creative director and visual QA lead reviewing rendered motion graphics keyframes.
 Contact-sheet image containing all sampled timestamps:
 - {snapshot_image_path}
-{cues_note}{tel_block}{beats_block}
+{style_block}{cues_note}{tel_block}{beats_block}
 CRITICAL CHECKS:
 1. Non-Blank Animated Presence:
-   - Keyframes MUST contain crisp, visible hand-drawn chalk graphics/labels (a completely blank frame-00 or multiple empty frames = `passes: false`). Note: slightly lower opacity right near a beat fade-out boundary is normal and should NOT fail QA.
+   - Keyframes MUST contain crisp, visible motion graphics/cards/labels (a completely blank frame-00 or multiple empty frames = `passes: false`). Note: slightly lower opacity right near a beat fade-out boundary is normal and should NOT fail QA.
 2. Layout Safe Area:
    - Centered graphics cleanly within x=40..1040, y={g_top}..{g_bot} are valid.
    - Caption keep-out band y={c_top}..{c_bot} must remain clear (do NOT fail minor bbox touches at y={g_bot}, only true spills below y={c_top + 10}).
 3. Visual Aesthetic:
-   - Hand-drawn sketchy chalk aesthetic (#F4EFE6 warm white, #FF8A3D warm accent, #C8F560 lime).
+   - {vision_aesthetic}
    - High legibility, zero colliding/stacked text from previous beats, zero clipped/cut-off labels.
-4. Set `passes: true` if illustrations are legible, on-style chalk sketches cleanly framing beats inside `#stage`; set `passes: false` ONLY for blank renders, overlapping stale beat elements, unreadable text, or true caption-band spills, listing concrete fixes in `fixes_needed`.
+4. Set `passes: true` if illustrations/cards are legible, match the active style aesthetic cleanly inside `#stage`; set `passes: false` ONLY for blank renders, overlapping stale beat elements, unreadable text, or true caption-band spills, listing concrete fixes in `fixes_needed`.
 
 Return valid JSON conforming to the vision critique schema. Output JSON only."""
 

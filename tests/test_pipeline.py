@@ -1351,4 +1351,140 @@ out("#s0,#s0_lbl", 3.6, 12);
             assert sheet_path and Path(sheet_path).exists()
 
 
+class TestPromotedStyleBlueprints:
+    PROMOTED_IDS = [
+        "news_card_spotlight",
+        "split_canvas_breakdown",
+        "depth_masked_motion",
+        "spatial_curiosity_diagram",
+        "monochrome_thesis_card",
+        "self_experiment_arc",
+        "collage_countdown_loop",
+    ]
+
+    def test_all_10_presets_contract_and_non_overlapping_bands(self):
+        expected = {"story_vertical", "retention_3step", "landscape_explainer", *self.PROMOTED_IDS}
+        assert expected.issubset(set(PRESETS.keys()))
+        assert len(PRESETS) == 10
+
+        for pid, preset in PRESETS.items():
+            assert preset["id"] == pid
+            assert preset["category"] in ("core", "reference")
+            assert preset["graphics_band"]["bottom"] <= preset["caption_band"]["top"], pid
+            style = preset.get("style_profile") or {}
+            for req_key in ("blueprint_id", "name", "hook_formula", "script_directive", "edl_directive", "graphics_mode", "graphics_directive", "vision_aesthetic"):
+                assert style.get(req_key), f"{pid} missing style_profile.{req_key}"
+
+    def test_api_presets_exposes_all_promoted_styles(self):
+        client = TestClient(app)
+        resp = client.get("/api/presets")
+        assert resp.status_code == 200
+        payload = resp.json()
+        ids = {p["id"] for p in payload["presets"]}
+        for pid in self.PROMOTED_IDS:
+            assert pid in ids
+
+    def test_style_profile_propagates_across_all_prompt_stages(self):
+        from agent_prompts import (
+            build_edl_prompt,
+            build_hyperframes_prompt,
+            build_hyperframes_revision_prompt,
+            build_script_critic_prompt,
+            build_vision_critique_prompt,
+        )
+
+        p = get_preset("news_card_spotlight")
+        sp = build_script_generation_prompt("Dog got swept offshore.", preset=p)
+        assert "News Card Spotlight" in sp
+        assert "#D8FF2B" in sp
+
+        cp = build_script_critic_prompt([{"id": "A", "script_text": "Dog got swept."}], "Dog got swept.", preset=p)
+        assert "News Card Spotlight" in cp
+
+        ep = build_edl_prompt({"title": "Offshore Rescue"}, "0.0-1.0 Dog swept", "Dog swept", preset=p)
+        assert "&H2BFFD8&" in ep
+        assert "spotlight news card" in ep.lower()
+
+        tl = {"total": 12.0, "parts": [{"id": "p01", "clip": "c01", "start": 0.0, "end": 4.0, "beat": "hook", "say": "Dog swept"}]}
+        edl = {"title": "Offshore Rescue", "parts": [{"id": "p01", "note": "Show 300m offshore card"}]}
+        hp = build_hyperframes_prompt(tl, edl, preset=p)
+        assert "news_card" in hp
+        assert "scrim(id" in hp and "mark(id" in hp
+
+        rp = build_hyperframes_revision_prompt(["blank"], ["fix"], {"total": 12.0}, "tl.set('#x',{opacity:1},0);", tl, edl, preset=p)
+        assert "news_card" in rp
+
+        vp = build_vision_critique_prompt("/tmp/sheet.jpg", preset=p)
+        assert "#D8FF2B highlighter sweeps" in vp
+
+    @pytest.mark.skipif(not adapters.HYPERFRAMES_BIN, reason="hyperframes CLI not installed")
+    def test_promoted_graphics_modes_pass_real_chromium_check(self):
+        from agent_prompts import build_fallback_scenes_js, render_hyperframes_index_html
+
+        tl = {
+            "total": 10.5,
+            "parts": [
+                {"id": "p01", "beat": "hook", "start": 0.0, "end": 3.4, "say": "A dog got swept offshore"},
+                {"id": "p02", "beat": "setup", "start": 3.4, "end": 7.0, "say": "300 meters away from beach safety"},
+                {"id": "p03", "beat": "twist", "start": 7.0, "end": 10.5, "say": "Never swim in alone after pets"},
+            ],
+        }
+        edl = {
+            "title": "Offshore Rescue Rule",
+            "parts": [
+                {"id": "p01", "note": "Hook: Swept far offshore"},
+                {"id": "p02", "note": "300m offshore warning report"},
+                {"id": "p03", "note": "Do not rescue pets yourself"},
+            ],
+        }
+
+        v6_hf_assets = adapters.V6_REF_DIR / "hf" / "assets"
+        for preset_id in ("news_card_spotlight", "monochrome_thesis_card", "depth_masked_motion"):
+            preset = get_preset(preset_id)
+            cues_data, scenes_js = build_fallback_scenes_js(tl, edl, preset)
+            html = render_hyperframes_index_html(preset, scenes_js, 10.5)
+
+            with tempfile.TemporaryDirectory() as td:
+                hf_dir = Path(td) / "hf"
+                assets_dir = hf_dir / "assets"
+                fonts_dir = assets_dir / "fonts"
+                fonts_dir.mkdir(parents=True, exist_ok=True)
+                if (v6_hf_assets / "gsap.min.js").exists():
+                    shutil.copy2(v6_hf_assets / "gsap.min.js", assets_dir / "gsap.min.js")
+                if (v6_hf_assets / "fonts").exists():
+                    for f in (v6_hf_assets / "fonts").glob("*.woff2"):
+                        shutil.copy2(f, fonts_dir / f.name)
+
+                (hf_dir / "hyperframes.json").write_text(
+                    json.dumps(
+                        {
+                            "$schema": "https://hyperframes.heygen.com/schema/hyperframes.json",
+                            "width": preset["width"],
+                            "height": preset["height"],
+                            "fps": preset["fps"],
+                            "duration": 10.5,
+                        }
+                    )
+                )
+                (hf_dir / "cues.json").write_text(json.dumps(cues_data, indent=2))
+                (hf_dir / "cues.js").write_text(f"window.CUES={json.dumps(cues_data)};\n")
+                (hf_dir / "index.html").write_text(html)
+
+                res = subprocess.run(
+                    [adapters.HYPERFRAMES_BIN, "check", str(hf_dir), "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                assert res.returncode == 0, f"{preset_id} check failed: {res.stdout}\n{res.stderr}"
+                check_data = json.loads(res.stdout)
+                assert check_data.get("ok") is True, f"{preset_id}: {check_data}"
+                assert check_data.get("lint", {}).get("errorCount", 0) == 0, f"{preset_id}: {check_data}"
+                assert check_data.get("runtime", {}).get("warningCount", 0) == 0, f"{preset_id}: {check_data}"
+                assert check_data.get("layout", {}).get("warningCount", 0) == 0, f"{preset_id}: {check_data}"
+                has_issues, issues = adapters._extract_check_issues(res.stdout)
+                assert not has_issues, f"{preset_id} unexpected check issues: {issues}"
+
+
+
 
