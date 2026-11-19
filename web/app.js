@@ -25,6 +25,9 @@ const state = {
   selectedPreset: "story_vertical",
   whisperAccuracy: "fast",
   aiBroll: "off",
+  jlCuts: "auto",
+  roomTone: "auto",
+  establishingShot: "auto",
 
   // Delivery & Gate State
   selectedScriptOption: "A",
@@ -815,13 +818,20 @@ function initPresetsAndOptions() {
     });
   });
 
-  // AI B-Roll selector
-  const brollSelect = document.getElementById("select-ai-broll");
-  if (brollSelect) {
-    brollSelect.addEventListener("change", (e) => {
-      state.aiBroll = e.target.value;
-    });
-  }
+  // AI B-Roll & Situational Craft selectors
+  [
+    ["select-ai-broll", "aiBroll"],
+    ["select-jl-cuts", "jlCuts"],
+    ["select-room-tone", "roomTone"],
+    ["select-establishing-shot", "establishingShot"]
+  ].forEach(([elId, stateKey]) => {
+    const sel = document.getElementById(elId);
+    if (sel) {
+      sel.addEventListener("change", (e) => {
+        state[stateKey] = e.target.value;
+      });
+    }
+  });
 
   // Primary Generate CTA
   const btnGen = document.getElementById("btn-generate-video");
@@ -839,6 +849,9 @@ async function triggerGenerateVideo() {
   const promptText = document.getElementById("input-story-prompt")?.value.trim() || "";
   const gateA = document.getElementById("toggle-gate-a")?.checked || false;
   const gateB = document.getElementById("toggle-gate-b")?.checked || false;
+  const jlCuts = document.getElementById("select-jl-cuts")?.value || state.jlCuts || "auto";
+  const roomTone = document.getElementById("select-room-tone")?.value || state.roomTone || "auto";
+  const establishingShot = document.getElementById("select-establishing-shot")?.value || state.establishingShot || "auto";
 
   const creativeModel = document.getElementById("select-creative-model")?.value || state.defaultModels.creative_model;
   const mechanicalModel = document.getElementById("select-mechanical-model")?.value || state.defaultModels.mechanical_model;
@@ -853,6 +866,9 @@ async function triggerGenerateVideo() {
       gate_b: gateB,
       whisper_model: state.whisperAccuracy === "high" ? "medium.en" : "small.en",
       ai_broll: state.aiBroll,
+      jl_cuts: jlCuts,
+      room_tone: roomTone,
+      establishing_shot: establishingShot,
       models: {
         creative_model: creativeModel,
         mechanical_model: mechanicalModel,
@@ -942,6 +958,16 @@ function connectJobEvents(jobId) {
   };
 }
 
+function classifyLogClass(msg, level) {
+  const lvl = String(level || "").toLowerCase();
+  if (lvl === "error" || lvl === "err") return "log-error";
+  if (lvl === "warn" || lvl === "warning") return "log-warn";
+  const text = String(msg || "");
+  if (/^\s*\[ERR\]/i.test(text)) return "log-error";
+  if (/^\s*\[WARN\]/i.test(text)) return "log-warn";
+  return "log-info";
+}
+
 function handleJobEvent(event) {
   if (!event || typeof event !== "object") return;
   const evType = event.type || event.event || "update";
@@ -955,7 +981,7 @@ function handleJobEvent(event) {
 
   if (evType === "log") {
     if (msg) {
-      appendConsoleLog(msg, event.level ? `log-${event.level}` : "log-info");
+      appendConsoleLog(msg, classifyLogClass(msg, event.level));
     }
   } else if (evType === "stage_started") {
     const stage = event.stage || event.data?.stage || "";
@@ -992,7 +1018,7 @@ function handleJobEvent(event) {
       renderStageRail(state.currentJob.stages);
     }
   } else if (msg) {
-    appendConsoleLog(msg, "log-info");
+    appendConsoleLog(msg, classifyLogClass(msg, event.level));
   }
 }
 

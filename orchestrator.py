@@ -345,6 +345,10 @@ class JobManager:
         bp = "comfyui" if raw_broll == "comfy" else raw_broll
         clips = clip_paths if clip_paths is not None else (selected_clips or [])
 
+        def _norm_craft(val: Any) -> str:
+            s = str(val or "auto").strip().lower()
+            return s if s in ("auto", "on", "off") else "auto"
+
         stages_dict: dict[str, Any] = {}
         for s in STAGE_ORDER:
             stages_dict[s] = {
@@ -375,6 +379,9 @@ class JobManager:
             "gate_b": bool(paa),
             "whisper_model": wm,
             "ai_broll": bp,
+            "jl_cuts": _norm_craft(cfg.get("jl_cuts")),
+            "room_tone": _norm_craft(cfg.get("room_tone")),
+            "establishing_shot": _norm_craft(cfg.get("establishing_shot")),
             "models": models_dict,
             "vision_model_explicit": vision_explicit,
         }
@@ -943,12 +950,14 @@ class JobManager:
                     clip_summary = self._load_clip_summary(work_dir)
 
                     _log(f"[EDL] Generating Edit Decision List (EDL) via AGY ({mechanical_model})...")
+                    job_cfg = job.get("config") or {}
                     edl_prompt = build_edl_prompt(
                         selected_script,
                         words_summary,
                         transcript_text,
                         preset,
                         clip_summary=clip_summary,
+                        job_options=job_cfg,
                     )
                     raw_edl = await run_agy_json(
                         edl_prompt,
@@ -970,9 +979,13 @@ class JobManager:
                 # STAGE 4: BASE CUT & QA GATE
                 # -------------------------------------------------------------
                 elif stage == "base_cut":
+                    job_cfg = job.get("config") or {}
+                    wm_setting = str(job_cfg.get("whisper_model") or job.get("whisper_model") or "small.en")
                     res = await run_build_and_qa(
                         job_dir,
                         preset=preset,
+                        whisper_model=wm_setting,
+                        craft_options=job_cfg,
                         cancel_event=cancel_event,
                         log_cb=_log,
                     )

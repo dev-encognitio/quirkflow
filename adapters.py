@@ -111,6 +111,22 @@ def check_tool_health() -> dict[str, dict[str, Any]]:
 # SUBPROCESS & CLI RUNNERS
 # ============================================================================
 
+def _classify_stderr_line(text: str) -> str:
+    """Classify subprocess stderr into [INFO], [WARN], or [ERR] without masking true failures."""
+    clean = text.rstrip()
+    lower = clean.lower()
+    if re.search(r"\[warn(?:ing)?\]|\bwarn(?:ing)?:", lower) or "[non-blocking]" in lower or "deprecated" in lower:
+        return f"[WARN] {clean}"
+    has_err = bool(
+        re.search(r"(?:\b\w*(?:error|exception)\b|\b(?:traceback|failed|fatal|critical)\b)", lower)
+        or lower.startswith("err:")
+        or "[err]" in lower
+    )
+    if has_err and "0 failed" not in lower and "no errors" not in lower and "0 errors" not in lower:
+        return f"[ERR] {clean}"
+    return f"[INFO] {clean}"
+
+
 async def _run_proc(
     cmd: list[str],
     cwd: str | Path | None = None,
@@ -157,7 +173,11 @@ async def _run_proc(
             chunks.append(text)
             if log_cb:
                 try:
-                    log_cb(f"[{'ERR' if is_err else 'OUT'}] {text.rstrip()}")
+                    if is_err:
+                        if text.strip():
+                            log_cb(_classify_stderr_line(text))
+                    else:
+                        log_cb(f"[OUT] {text.rstrip()}")
                 except Exception:
                     pass
 
@@ -894,8 +914,15 @@ async def run_ingest_transcribe(
     }
 
 
-def _normalize_ass_color(value: Any, default: str = "&H3D8AFF&") -> str:
-    """Normalize RGB hex (#RRGGBB) or ASS BGR (&HBBGGRR&) color strings to ASS BGR format."""
+_DEFAULT_HIGHLIGHT_PALETTE: dict[str, str] = {"pink": "&HA04FFF&", "blue": "&HFF6B3D&"}
+
+
+def _normalize_ass_color(
+    value: Any,
+    default: str = "&H3D8AFF&",
+    palette: dict[str, Any] | None = None,
+) -> str:
+    """Normalize symbolic palette names, RGB hex (#RRGGBB), or ASS BGR (&HBBGGRR&) color strings."""
     s = str(value or "").strip()
     if re.fullmatch(r"&H[0-9A-Fa-f]{6}&?", s):
         return s if s.endswith("&") else f"{s}&"
@@ -903,19 +930,46 @@ def _normalize_ass_color(value: Any, default: str = "&H3D8AFF&") -> str:
     if m:
         r, g, b = m.group(1), m.group(2), m.group(3)
         return f"&H{b.upper()}{g.upper()}{r.upper()}&"
+    if s:
+        lookup = palette if palette is not None else _DEFAULT_HIGHLIGHT_PALETTE
+        mapped = lookup.get(s.lower())
+        if mapped is not None and str(mapped).strip().lower() != s.lower():
+            return _normalize_ass_color(mapped, default=default, palette={})
     return default
+
+
+def _format_ass_dialogue(
+    say_text: str,
+    highlight_map: dict[str, str],
+    names_map: dict[str, str],
+) -> str:
+    """Apply proper-noun fixes and keyword ASS color tags for landscape lower-third captions."""
+    tokens: list[str] = []
+    for raw in str(say_text or "").split():
+        clean = re.sub(r"[^a-z0-9']", "", raw.lower())
+        fixed = names_map.get(clean, raw) if clean in names_map else raw
+        color = highlight_map.get(clean)
+        if color:
+            tokens.append(f"{{\\c{color}}}{fixed}{{\\c&HFFFFFF&}}")
+        else:
+            tokens.append(fixed)
+    return " ".join(tokens)
 
 
 async def run_build_and_qa(
     job_dir: Path,
     preset: dict[str, Any],
     edl: dict[str, Any] | None = None,
+    whisper_model: str = "small.en",
+    craft_options: dict[str, Any] | None = None,
     cancel_event: asyncio.Event | None = None,
     log_cb: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Stage 4: Assemble video spine via build.py, run qa.py, remove disfluencies via stutters.py, and diff script."""
     work_dir = job_dir / "work"
     src_dir = work_dir / "src"
+    model_name = str(whisper_model or "small.en").strip() or "small.en"
+    craft_opts = craft_options or {}
 
     words_data: dict[str, Any] = {}
     if (work_dir / "words.json").exists():
@@ -933,15 +987,16 @@ async def run_build_and_qa(
         raise FileNotFoundError("edl.json missing in workdir.")
 
     # Merge EDL keyword highlights, name normalizations, and ingest luma gamma into config.json
+    raw_palette = preset.get("highlight_colors") or _DEFAULT_HIGHLIGHT_PALETTE
     merged_highlight: dict[str, str] = {
-        str(k).lower(): _normalize_ass_color(v)
-        for k, v in (preset.get("highlight_colors") or {"pink": "&HA04FFF&", "blue": "&HFF6B3D&"}).items()
+        str(k).lower(): _normalize_ass_color(v, palette=_DEFAULT_HIGHLIGHT_PALETTE)
+        for k, v in raw_palette.items()
         if str(k).strip()
     }
     for k, v in (fixed_edl.get("highlight") or {}).items():
         clean_k = re.sub(r"[^a-z0-9']", "", str(k).lower())
         if clean_k:
-            merged_highlight[clean_k] = _normalize_ass_color(v)
+            merged_highlight[clean_k] = _normalize_ass_color(v, palette=merged_highlight)
 
     merged_names: dict[str, str] = {"christian": "Christian"}
     for k, v in (fixed_edl.get("names") or {}).items():
@@ -958,12 +1013,26 @@ async def run_build_and_qa(
         except Exception:
             pass
 
+    def _norm_mode(val: Any, default: str = "auto") -> str:
+        s = str(val or default).strip().lower()
+        return s if s in ("auto", "on", "off") else default
+
+    climax_dip = float(
+        craft_opts.get("climax_silence_dip_s")
+        or (preset.get("style_profile") or {}).get("climax_silence_dip_s")
+        or 0.0
+    )
     config_data = {
         "src": str(src_dir / "%s.mp4"),
         "highlight": merged_highlight,
         "names": merged_names,
         "zoom": preset.get("zoom", 1.08),
         "gamma": round(gamma_val, 3),
+        "whisper_model": model_name,
+        "climax_silence_dip_s": round(max(0.0, min(0.5, climax_dip)), 3),
+        "jl_cuts": _norm_mode(craft_opts.get("jl_cuts") or preset.get("jl_cuts"), "auto"),
+        "room_tone": _norm_mode(craft_opts.get("room_tone") or preset.get("room_tone"), "auto"),
+        "establishing_shot": _norm_mode(craft_opts.get("establishing_shot") or preset.get("establishing_shot"), "auto"),
     }
     (work_dir / "config.json").write_text(json.dumps(config_data, indent=2))
 
@@ -1003,6 +1072,7 @@ async def run_build_and_qa(
             str(SCRIPTS_DIR / "qa.py"),
             str(work_dir),
             "base.mp4",
+            model_name,
         ]
         code, qa_out, _ = await _run_proc(qa_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
 
@@ -1019,6 +1089,7 @@ async def run_build_and_qa(
             "-I",
             str(SCRIPTS_DIR / "stutters.py"),
             str(work_dir),
+            model_name,
         ]
         await _run_proc(stutters_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
 
@@ -1041,28 +1112,6 @@ async def run_build_and_qa(
             except Exception:
                 pass
 
-        # Always re-extract base16.wav from the final base.mp4 (never reuse stale pre-rebuild base16.wav)
-        await _run_proc(
-            [FFMPEG_BIN, "-v", "error", "-y", "-i", "base.mp4", "-vn", "-ac", "1", "-ar", "16000", "base16.wav"],
-            cwd=work_dir,
-            cancel_event=cancel_event,
-        )
-
-        vad_script = (
-            "import wave,numpy as np\n"
-            "from faster_whisper import WhisperModel\n"
-            "w=wave.open('base16.wav');a=np.frombuffer(w.readframes(w.getnframes()),np.int16).astype(np.float32)/32768\n"
-            "m=WhisperModel('small.en',compute_type='int8')\n"
-            "segs,_=m.transcribe(a,language='en',vad_filter=True,word_timestamps=True,condition_on_previous_text=False)\n"
-            "with open('final_transcript.txt','w') as f:\n"
-            "    for s in segs: f.write(f'[{s.start:6.1f}] '+' '.join(x.word.strip() for x in s.words)+'\\n')\n"
-        )
-        await _run_proc(
-            [UV_BIN, "run", "--with", "faster-whisper", "--with", "numpy", "python", "-c", vad_script],
-            cwd=work_dir,
-            cancel_event=cancel_event,
-        )
-
         diff_cmd = [
             "python3",
             "-I",
@@ -1075,25 +1124,46 @@ async def run_build_and_qa(
         # Landscape Explainer (1920x1080) Adapter
         if log_cb:
             log_cb("[BUILD] Generating landscape 1920x1080 explainer video...")
-        edl_data = json.load(open(work_dir / "edl.json"))
-        # Render 16:9 base video using standard filter_complex
+        edl_data = json.loads((work_dir / "edl.json").read_text())
+        parts = edl_data.get("parts", [])
         ins: list[str] = []
         fc: list[str] = []
-        for idx, part in enumerate(edl_data["parts"]):
+        for idx, part in enumerate(parts):
             clip_path = src_dir / f"{part['clip']}.mp4"
-            r0, r1 = part["range"]
-            dur = r1 - r0
+            r0, r1 = float(part["range"][0]), float(part["range"][1])
+            dur = max(0.08, r1 - r0)
             ins.extend(["-ss", f"{r0:.3f}", "-t", f"{dur:.3f}", "-i", str(clip_path)])
+
+            prev_p = parts[idx - 1] if idx > 0 else None
+            nxt_p = parts[idx + 1] if idx + 1 < len(parts) else None
+            touch_prev = bool(
+                prev_p
+                and prev_p.get("clip") == part.get("clip")
+                and abs(r0 - float(prev_p["range"][1])) <= 0.04
+            )
+            touch_next = bool(
+                nxt_p
+                and nxt_p.get("clip") == part.get("clip")
+                and abs(float(nxt_p["range"][0]) - r1) <= 0.04
+            )
+            af_steps = ["highpass=f=90"]
+            if not touch_prev:
+                af_steps.append(f"afade=t=in:d={min(0.015, dur * 0.4):.3f}")
+            if not touch_next:
+                fade_out = min(0.025, dur * 0.4)
+                af_steps.append(f"afade=t=out:st={max(0.0, dur - fade_out):.3f}:d={fade_out:.3f}")
+            af_steps.extend(["aresample=48000", "asetpts=PTS-STARTPTS"])
+
             fc.append(
                 f"[{idx}:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=30,setsar=1,setpts=PTS-STARTPTS[v{idx}];"
-                f"[{idx}:a]aresample=48000,asetpts=PTS-STARTPTS[a{idx}]"
+                f"[{idx}:a]{','.join(af_steps)}[a{idx}]"
             )
 
-        n_clips = len(edl_data["parts"])
+        n_clips = len(parts)
         concat_str = "".join(f"[v{i}][a{i}]" for i in range(n_clips)) + f"concat=n={n_clips}:v=1:a=1[v][a]"
         fc.append(concat_str)
 
-        # Generate lower-third ASS subtitles for landscape
+        # Generate lower-third ASS subtitles for landscape (skip silent establishing shots)
         ass_content = (
             "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n"
             "[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
@@ -1102,20 +1172,24 @@ async def run_build_and_qa(
         )
         cur_time = 0.0
         timeline_rows = []
-        for idx, part in enumerate(edl_data["parts"]):
-            r0, r1 = part["range"]
-            d = r1 - r0
+        for idx, part in enumerate(parts):
+            r0, r1 = float(part["range"][0]), float(part["range"][1])
+            d = max(0.08, r1 - r0)
             end_t = cur_time + d
-            st_str = f"0:{int(cur_time // 60):02d}:{cur_time % 60:05.2f}"
-            et_str = f"0:{int(end_t // 60):02d}:{end_t % 60:05.2f}"
-            ass_content += f"Dialogue: 0,{st_str},{et_str},Cap,,0,0,0,,{part['say']}\n"
+            say_txt = str(part.get("say") or "").strip()
+            if say_txt and str(part.get("shot_type") or "talking").lower() != "establishing":
+                st_str = f"0:{int(cur_time // 60):02d}:{cur_time % 60:05.2f}"
+                et_str = f"0:{int(end_t // 60):02d}:{end_t % 60:05.2f}"
+                ass_line = _format_ass_dialogue(say_txt, merged_highlight, merged_names)
+                ass_content += f"Dialogue: 0,{st_str},{et_str},Cap,,0,0,0,,{ass_line}\n"
             timeline_rows.append(
                 {
                     "id": part.get("id"),
                     "clip": part["clip"],
                     "start": round(cur_time, 2),
                     "end": round(end_t, 2),
-                    "say": part["say"],
+                    "say": say_txt,
+                    "beat": part.get("beat") or "setup",
                 }
             )
             cur_time = end_t
@@ -1150,9 +1224,32 @@ async def run_build_and_qa(
             "160k",
             "base.mp4",
         ]
-        await _run_proc(render_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
+        rcode, rout, rerr = await _run_proc(render_cmd, cwd=work_dir, cancel_event=cancel_event, log_cb=log_cb)
+        if rcode != 0 or not (work_dir / "base.mp4").exists():
+            raise RuntimeError(f"Landscape base render failed: {rerr}\n{rout}")
         qa_out = "PASS (Landscape)"
         diff_out = "0 differences"
+
+    # Always extract final base16.wav + final_transcript.txt for Stage 8 titles/descriptions
+    await _run_proc(
+        [FFMPEG_BIN, "-v", "error", "-y", "-i", "base.mp4", "-vn", "-ac", "1", "-ar", "16000", "base16.wav"],
+        cwd=work_dir,
+        cancel_event=cancel_event,
+    )
+    vad_script = (
+        "import wave,numpy as np\n"
+        "from faster_whisper import WhisperModel\n"
+        "w=wave.open('base16.wav');a=np.frombuffer(w.readframes(w.getnframes()),np.int16).astype(np.float32)/32768\n"
+        f"m=WhisperModel({json.dumps(model_name)},compute_type='int8')\n"
+        "segs,_=m.transcribe(a,language='en',vad_filter=True,word_timestamps=True,condition_on_previous_text=False)\n"
+        "with open('final_transcript.txt','w') as f:\n"
+        "    for s in segs: f.write(f'[{s.start:6.1f}] '+' '.join(x.word.strip() for x in s.words)+'\\n')\n"
+    )
+    await _run_proc(
+        [UV_BIN, "run", "--with", "faster-whisper", "--with", "numpy", "python", "-c", vad_script],
+        cwd=work_dir,
+        cancel_event=cancel_event,
+    )
 
     # Compile QA Report
     bursts = []
@@ -1212,6 +1309,7 @@ async def run_build_and_qa(
         "stutters_cut": stutters_cut,
         "bursts_detected": len(bursts),
         "bursts": bursts[:10],
+        "whisper_model": model_name,
         "qa_log": qa_out[:1000] if qa_out else "",
         "diff_summary": diff_out.strip() if diff_out else "",
     }
@@ -1480,6 +1578,12 @@ async def run_motion_graphics(
     # Capture snapshots for Art Director critique
     snapshots_dir = hf_dir / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+    def _purge_snapshots() -> None:
+        for old_png in snapshots_dir.glob("frame-*.png"):
+            old_png.unlink(missing_ok=True)
+
+    _purge_snapshots()
     if log_cb:
         log_cb("[GRAPHICS] Capturing preview keyframe snapshots...")
     await _run_proc(
@@ -1569,6 +1673,7 @@ async def run_motion_graphics(
                     cues_data, scenes_js = build_fallback_scenes_js(timeline_data, edl_data, preset)
                     _write_scene_files(cues_data, scenes_js)
                     await _run_proc(["node", "cues.mjs"], cwd=hf_dir, cancel_event=cancel_event)
+                _purge_snapshots()
                 await _run_proc(
                     [HYPERFRAMES_BIN, "snapshot", "hf", "--no-browser-gpu", "--output", str(snapshots_dir), "--frames", "5"],
                     cwd=job_dir,
@@ -1910,6 +2015,28 @@ async def _extract_cover_candidates(
     return candidate_frames
 
 
+def _find_foreground_sticker_bbox(img: Any, g_top: int, g_bot: int) -> tuple[int, int, int, int] | None:
+    """Return foreground card/stroke bbox within [g_top, g_bot], ignoring dark translucent .scrim fills."""
+    from PIL import Image, ImageChops
+
+    y0 = max(0, int(g_top))
+    y1 = min(img.height, int(g_bot))
+    if y1 <= y0:
+        return None
+    band = img.crop((0, y0, img.width, y1)).convert("RGBA")
+    r_ch, g_ch, b_ch, a_ch = band.split()
+    bright = ImageChops.lighter(ImageChops.lighter(r_ch, g_ch), b_ch)
+    opaque_fg = Image.eval(a_ch, lambda a: 255 if a >= 200 else 0)
+    bright_fg = ImageChops.darker(
+        Image.eval(a_ch, lambda a: 255 if a >= 40 else 0),
+        Image.eval(bright, lambda v: 255 if v >= 45 else 0),
+    )
+    bbox = ImageChops.lighter(opaque_fg, bright_fg).getbbox() or a_ch.getbbox()
+    if not bbox:
+        return None
+    return (bbox[0], bbox[1] + y0, bbox[2], bbox[3] + y0)
+
+
 async def _extract_cover_sticker(
     work_dir: Path,
     cover_dir: Path,
@@ -1946,12 +2073,8 @@ async def _extract_cover_sticker(
             continue
         try:
             with Image.open(tmp_png).convert("RGBA") as img:
-                alpha = img.getchannel("A")
-                # Restrict search to graphics band to avoid picking empty borders
-                cropped_band = alpha.crop((0, max(0, g_top), img.width, min(img.height, g_bot)))
-                bbox = cropped_band.getbbox()
-                if bbox:
-                    full_bbox = (bbox[0], bbox[1] + max(0, g_top), bbox[2], bbox[3] + max(0, g_top))
+                full_bbox = _find_foreground_sticker_bbox(img, g_top, g_bot)
+                if full_bbox:
                     bw = full_bbox[2] - full_bbox[0]
                     bh = full_bbox[3] - full_bbox[1]
                     area = bw * bh

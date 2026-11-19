@@ -133,6 +133,12 @@ EDL_SCHEMA: dict[str, Any] = {
                     "hold": {"type": "number"},
                     "beat": {"type": "string"},
                     "note": {"type": "string"},
+                    "shot_type": {
+                        "type": "string",
+                        "enum": ["talking", "establishing", "broll"],
+                    },
+                    "j_cut_s": {"type": "number"},
+                    "l_cut_s": {"type": "number"},
                 },
                 "required": ["id", "clip", "range", "say"],
             },
@@ -303,12 +309,23 @@ def validate_and_fix_edl_overlaps(
             e = s + 0.5
         part["range"] = [round(s, 3), round(e, 3)]
         part["hold"] = max(0.0, float(part.get("hold", 0.0)))
+        if "j_cut_s" in part and part["j_cut_s"] is not None:
+            part["j_cut_s"] = round(max(0.0, min(0.6, float(part["j_cut_s"]))), 3)
+        if "l_cut_s" in part and part["l_cut_s"] is not None:
+            part["l_cut_s"] = round(max(0.0, min(0.6, float(part["l_cut_s"]))), 3)
+        shot_type = str(part.get("shot_type") or "talking").strip().lower()
+        if shot_type not in ("talking", "establishing", "broll"):
+            shot_type = "talking"
+        if "shot_type" in part:
+            part["shot_type"] = shot_type
 
         # Snap/repair misaligned ranges against word timestamps so build.py match() succeeds.
         clip_id = str(part.get("clip", ""))
         words = (words_by_clip or {}).get(clip_id, [])
         say = str(part.get("say", "")).strip()
-        if words and say:
+        if shot_type == "establishing" and not say:
+            part["range"] = [round(s, 3), round(max(s + 0.4, min(e, s + 2.5)), 3)]
+        elif words and say:
             in_range = _find_word_match_span(words, say, target_range=part["range"], restrict_to_range=True)
             if in_range is None:
                 best_span = _find_word_match_span(words, say, target_range=part["range"], restrict_to_range=False)
@@ -333,8 +350,89 @@ def validate_and_fix_edl_overlaps(
             continue
         _resolve_same_clip_overlap(curr, nxt, (words_by_clip or {}).get(str(curr.get("clip", "")), []))
 
-    fixed_edl["parts"] = fixed_parts
+    fixed_edl["parts"] = _merge_contiguous_talking_parts(fixed_parts, words_by_clip)
     return fixed_edl
+
+
+def _has_skipped_words_in_gap(
+    words: list[list[Any]],
+    gap_start: float,
+    gap_end: float,
+) -> bool:
+    """Return True if any transcribed word falls strictly inside (gap_start, gap_end)."""
+    if not words or gap_end <= gap_start + 0.02:
+        return False
+    for w in words:
+        try:
+            ws, we = float(w[1]), float(w[2])
+        except (IndexError, TypeError, ValueError):
+            continue
+        mid = (ws + we) * 0.5
+        if ws >= gap_start - 0.01 and we <= gap_end + 0.01 and gap_start < mid < gap_end:
+            return True
+    return False
+
+
+def _merge_contiguous_talking_parts(
+    parts: list[dict[str, Any]],
+    words_by_clip: dict[str, list[list[Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Merge consecutive chronological same-clip talking parts separated by <=0.35s of speech with no cut words."""
+    if len(parts) < 2:
+        return parts
+    merged: list[dict[str, Any]] = [dict(parts[0])]
+    for raw_nxt in parts[1:]:
+        nxt = dict(raw_nxt)
+        curr = merged[-1]
+        c_say = str(curr.get("say") or "").strip()
+        n_say = str(nxt.get("say") or "").strip()
+        same_clip = curr.get("clip") == nxt.get("clip")
+        curr_shot = str(curr.get("shot_type") or "talking").lower()
+        nxt_shot = str(nxt.get("shot_type") or "talking").lower()
+        no_jl = (
+            not float(nxt.get("j_cut_s") or 0.0)
+            and not float(nxt.get("l_cut_s") or 0.0)
+            and not float(curr.get("l_cut_s") or 0.0)
+        )
+        same_beat_flow = not (nxt.get("beat") == "climax" and curr.get("beat") != "climax")
+        curr_s, curr_e = float(curr["range"][0]), float(curr["range"][1])
+        nxt_s, nxt_e = float(nxt["range"][0]), float(nxt["range"][1])
+        range_gap = nxt_s - curr_e
+        clip_words = (words_by_clip or {}).get(str(curr.get("clip", "")), [])
+
+        can_merge = False
+        if (
+            same_clip
+            and c_say
+            and n_say
+            and clip_words
+            and curr_shot == "talking"
+            and nxt_shot == "talking"
+            and no_jl
+            and same_beat_flow
+            and -1e-6 <= range_gap <= 0.35
+            and (nxt_e - curr_s) <= 14.0
+        ):
+            curr_ws = [w for w in clip_words if float(w[2]) > curr_s and float(w[1]) < curr_e]
+            nxt_ws = [w for w in clip_words if float(w[2]) > nxt_s and float(w[1]) < nxt_e]
+            if curr_ws and nxt_ws:
+                last_w_end = float(curr_ws[-1][2])
+                first_w_start = float(nxt_ws[0][1])
+                word_gap = first_w_start - last_w_end
+                if -0.05 <= word_gap <= 0.35 and not _has_skipped_words_in_gap(clip_words, last_w_end, first_w_start):
+                    can_merge = True
+
+        if can_merge:
+            curr["range"] = [round(curr_s, 3), round(nxt_e, 3)]
+            curr["hold"] = max(0.0, float(nxt.get("hold", 0.0)))
+            curr["say"] = f"{c_say} {n_say}".strip()
+            c_note = str(curr.get("note", "")).strip()
+            n_note = str(nxt.get("note", "")).strip()
+            if n_note and n_note != c_note:
+                curr["note"] = f"{c_note} / {n_note}" if c_note else n_note
+            continue
+        merged.append(nxt)
+    return merged
 
 
 def _norm_token(text: str) -> str:
@@ -631,11 +729,26 @@ def build_edl_prompt(
     transcript_text: str,
     preset: dict[str, Any] | None = None,
     clip_summary: str = "",
+    job_options: dict[str, Any] | None = None,
 ) -> str:
     """Build the prompt for generating the Edit Decision List (EDL) and config."""
     script_str = json.dumps(selected_script, indent=2)
     style_block = _format_style_profile_block(preset, stage="edl")
     clip_block = f"\nSOURCE CLIP INFO:\n{clip_summary}\n" if clip_summary else ""
+    opts = job_options or {}
+    jl_mode = str(opts.get("jl_cuts", "auto")).lower()
+    rt_mode = str(opts.get("room_tone", "auto")).lower()
+    est_mode = str(opts.get("establishing_shot", "auto")).lower()
+    craft_block = (
+        f"\nSITUATIONAL CRAFT CONTROLS (jl_cuts={jl_mode}, room_tone={rt_mode}, establishing_shot={est_mode}):\n"
+        "- Optional per-part 'shot_type': 'talking' (default), 'establishing', or 'broll'.\n"
+        "  * If establishing_shot='off': NEVER emit 'establishing'. Start immediately on speech.\n"
+        "  * If establishing_shot='auto': Situational — emit a 0.8-1.5s wide 'establishing' shot ONLY when pre-speech environmental framing or essay pacing earns it (or pair it with p02 'j_cut_s' so hook speech begins over the wide frame); for immediate punchy vertical talking hooks, omit 'establishing'.\n"
+        "  * If establishing_shot='on': Include a 0.8-1.5s wide 'establishing' opener (say=\"\") before rapid close cuts, optionally paired with p02 'j_cut_s' so hook speech arrives smoothly over the opener.\n"
+        "- Optional per-part 'j_cut_s' / 'l_cut_s' (0.0-0.6s, active when jl_cuts != 'off'):\n"
+        "  * Situational smooth audio-visual bridges across clip switches or breath lead-ins into 'establishing'/'broll' cuts.\n"
+        "  * NEVER desync talking-head mouth movement from spoken words — keep J/L overlaps strictly on silence/breath lead-ins or cross-clip/non-sync transitions."
+    )
     return f"""Do NOT read external files or run shell commands. Work strictly from the provided inputs and output valid JSON only.
 
 You are a precision video assembly engineer. Build an exact Edit Decision List (edl.json) matching the approved script and active style preset.
@@ -656,14 +769,18 @@ EDL REQUIREMENTS:
    - 'id': 'p01', 'p02', ...
    - 'clip': Source clip id ('c01', 'c02', ...).
    - 'range': [start_seconds, end_seconds] enclosing every spoken word in 'say' from CLIP TRANSCRIPTS.
-   - 'say': EXACT verbatim words spoken in that source range.
+   - 'say': EXACT verbatim words spoken in that source range (or "" for silent 'establishing').
    - 'hold': Float tail hold (0.0 to 0.15).
    - 'beat': 'hook' | 'setup' | 'twist' | 'climax' | 'loop'.
+   - 'shot_type': Optional 'talking' | 'establishing' | 'broll'.
+   - 'j_cut_s' / 'l_cut_s': Optional float (0.0 to 0.6) when bridging non-lip-sync / cross-clip transitions.
    - 'note': Specific visual motion-graphic cue idea for this beat matching the active style's graphics mode (e.g., chalk diagram, spotlight news card phrase to highlight, checklist rows, quote card, or countdown metric).
+{craft_block}
 
 CRITICAL ASSEMBLY & COHERENCE RULES:
 - Match the cutting rhythm / average shot length requested by the active style preset while preserving fluent spoken clause joins.
 - Every cut transition `p[i].say` -> `p[i+1].say` MUST form fluent, grammatical spoken English when read straight through! Always include clause lead-ins ("because...", "and when...", "so...") inside the part so joins never sound like chopped word salad.
+- Do NOT split a continuous single-clip spoken sentence across multiple adjacent EDL parts unless removing stutters/long pauses (>0.45s) or marking a distinct visual beat change.
 - Avoid gratuitous clip ping-ponging mid-thought unless starting a deliberate distinct beat.
 - Never let consecutive chronological parts on the same clip overlap in source time.
 - Ensure 'say' matches verbatim words inside 'range' so word-level matching scores >= 0.90.
@@ -717,6 +834,7 @@ def render_hyperframes_index_html(
 
     return f"""<!doctype html><html lang="en"><head><meta charset="UTF-8"/>
 <meta name="viewport" content="width={w}, height={h}"/>
+<link rel="icon" href="data:,"/>
 <script src="assets/gsap.min.js"></script><script src="cues.js"></script>
 <style>
 @font-face{{font-family:'Marker';src:url('assets/fonts/PermanentMarker.woff2') format('woff2')}}
@@ -731,7 +849,7 @@ html,body{{margin:0;width:{w}px;height:{h}px;overflow:hidden;background:transpar
 .hw{{position:absolute;opacity:0;white-space:nowrap;color:#F4EFE6;font:400 {title_size}px/1.1 'Marker',cursive;text-shadow:0 3px 0 rgba(0,0,0,.5),0 6px 16px rgba(0,0,0,.65)}}
 .cv{{font:700 {cv_size}px/1.1 'Caveat',cursive}}
 .scrim{{position:absolute;left:0;top:{g_top}px;width:{w}px;height:{scrim_h}px;opacity:0;background:radial-gradient(ellipse at center,rgba(10,12,18,.68) 0%,rgba(6,8,14,.86) 100%);pointer-events:none}}
-.ecard{{position:absolute;opacity:0;background:#F8FAFC;color:#0F172A;border-radius:22px;padding:24px 28px;border:2px solid rgba(15,23,42,.12);box-shadow:0 18px 42px rgba(0,0,0,.55);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
+.ecard{{position:absolute;opacity:0;background:#F8FAFC;color:#0F172A;border-radius:22px;padding:24px 28px;border:2px solid rgba(15,23,42,.12);box-shadow:0 18px 42px rgba(0,0,0,.55);font:500 30px/1.34 system-ui,sans-serif}}
 .ecard.ecard-dark{{background:rgba(12,16,26,.92);color:#F8FAFC;border-color:rgba(255,255,255,.16)}}
 .ebadge{{display:inline-block;padding:4px 14px;border-radius:8px;background:#B91C1C;color:#FFFFFF;font-size:28px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;margin-bottom:10px}}
 .ehead{{font-size:38px;font-weight:800;line-height:1.18;color:#0B0F19;margin-bottom:10px}}
@@ -741,13 +859,13 @@ html,body{{margin:0;width:{w}px;height:{h}px;overflow:hidden;background:transpar
 .hlm{{position:relative;display:inline-block;padding:0 8px;border-radius:6px;isolation:isolate;color:#0B0F19}}
 .hlm-bg{{position:absolute;left:0;top:4%;width:100%;height:92%;background:#D8FF2B;border-radius:6px;transform:scaleX(0);transform-origin:left center;z-index:0}}
 .hlm-txt{{position:relative;z-index:1}}
-.hpill{{position:absolute;opacity:0;background:rgba(13,17,26,.9);color:#F8FAFC;border:1.5px solid rgba(255,255,255,.18);border-radius:16px;padding:16px 22px;box-shadow:0 12px 28px rgba(0,0,0,.5);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}
+.hpill{{position:absolute;opacity:0;background:rgba(13,17,26,.9);color:#F8FAFC;border:1.5px solid rgba(255,255,255,.18);border-radius:16px;padding:16px 22px;box-shadow:0 12px 28px rgba(0,0,0,.5);font:600 30px/1.28 system-ui,sans-serif}}
 .prow{{display:flex;align-items:center;gap:10px;font-size:30px;font-weight:700;line-height:1.28;margin:4px 0}}
 .pchk{{color:#4ADE80;font-weight:900}}
-.qbox{{position:absolute;opacity:0;background:#F8FAFC;color:#0A0A0C;border-radius:14px;padding:28px 34px;box-shadow:0 20px 48px rgba(0,0,0,.6);font-family:Georgia,'Times New Roman',serif;text-align:center}}
+.qbox{{position:absolute;opacity:0;background:#F8FAFC;color:#0A0A0C;border-radius:14px;padding:28px 34px;box-shadow:0 20px 48px rgba(0,0,0,.6);font:700 46px/1.18 Georgia,serif;text-align:center}}
 .qbox.qbox-dark{{background:#0B0C10;color:#F8FAFC;border:1.5px solid rgba(255,255,255,.22)}}
 .qt{{font-size:46px;font-weight:700;line-height:1.18}}
-.qs{{font-family:-apple-system,sans-serif;font-size:28px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.78;margin-top:12px}}
+.qs{{font:700 28px/1.15 system-ui,sans-serif;letter-spacing:.08em;text-transform:uppercase;opacity:.78;margin-top:12px}}
 </style></head><body>
 <div id="root" data-composition-id="main" data-start="0" data-duration="{total_dur:.2f}" data-width="{w}" data-height="{h}" data-fps="{fps}">
 <svg width="0" height="0" style="position:absolute">
@@ -862,8 +980,22 @@ def build_fallback_scenes_js(
             js_lines.append(f'tl.to("#fbFrame", {{y: -4, duration: 0.8, ease: "sine.inOut"}}, {min(1.5, last_end - 0.8):.2f});')
         js_lines.append(f'out("#fbFrame,#fbTitle", {max(0.4, last_end - 0.3):.2f});')
 
+    def _append_periodic_nudges(target_sel: str, beat_s: float, beat_e: float, pulse_origin: str | None = None) -> None:
+        if beat_e - beat_s <= 2.2:
+            return
+        t_nudge = beat_s + 2.0
+        step = 0
+        while t_nudge < beat_e - 0.85:
+            if pulse_origin:
+                js_lines.append(f'pulse("{target_sel}", "{pulse_origin}", {t_nudge:.2f}, 1.06);')
+            else:
+                dy = -6 if step % 2 == 0 else 0
+                js_lines.append(f'tl.to("{target_sel}", {{y: {dy}, duration: 0.7, ease: "sine.inOut"}}, {t_nudge:.2f});')
+            t_nudge += 2.2
+            step += 1
+
     # Group beats chronologically cleanly (non-overlapping across the safe band)
-    for idx, b in enumerate(beats[:10]):
+    for idx, b in enumerate(beats):
         s = max(last_end if idx > 0 else 0.0, float(b["start"]))
         e = min(total, float(b["end"]))
         if idx == 0:
@@ -891,15 +1023,15 @@ def build_fallback_scenes_js(
                     f'card("{lid}", "REPORT", hl({json.dumps(cue_text)}), "", {card_x}, {mid_card_y}, {{w: {card_w}, bcol: "#B91C1C"}});',
                     f'pop("{lid}", {s + 0.08:.2f}, "50% 50%");',
                     f'mark("{lid}", {s + 0.45:.2f}, 0.42);',
-                    f'out("#{lid}", {max(s + 0.6, e - 0.28):.2f});',
                 ])
+                _append_periodic_nudges(f"#{lid}", s, e)
+                js_lines.append(f'out("#{lid}", {max(s + 0.6, e - 0.28):.2f});')
             else:
                 js_lines.extend([
                     f'card("{lid}", "FACT", {json.dumps(cue_text)}, "", {card_x}, {lower_y}, {{w: {card_w}, dark: 1, bcol: "#1D4ED8"}});',
                     f'lin("{lid}", {s:.2f}, 0.32);',
                 ])
-                if e - s > 2.2:
-                    js_lines.append(f'tl.to("#{lid}", {{y: -6, duration: 0.7, ease: "sine.inOut"}}, {round((s + e) / 2.0, 2):.2f});')
+                _append_periodic_nudges(f"#{lid}", s, e)
                 js_lines.append(f'out("#{lid}", {max(s + 0.5, e - 0.28):.2f});')
         elif g_mode == "monochrome_essay":
             dark_flag = 0 if idx % 2 == 1 else 1
@@ -908,8 +1040,7 @@ def build_fallback_scenes_js(
                 f'quoteBox("{lid}", {json.dumps(cue_text)}, "IDEA", {card_x}, {qy}, {{w: {card_w}, dark: {dark_flag}}});',
                 f'lin("{lid}", {s:.2f}, 0.34);',
             ])
-            if e - s > 2.2:
-                js_lines.append(f'tl.to("#{lid}", {{y: -6, duration: 0.7, ease: "sine.inOut"}}, {round((s + e) / 2.0, 2):.2f});')
+            _append_periodic_nudges(f"#{lid}", s, e)
             js_lines.append(f'out("#{lid}", {max(s + 0.5, e - 0.28):.2f});')
         elif g_mode in ("motion_pills", "spatial_proof", "experiment_data", "countdown_collage", "split_ui"):
             badge_tag = f"{idx:02d}" if g_mode != "countdown_collage" else f"00:{max(0, 25 - idx * 3):02d}"
@@ -918,8 +1049,7 @@ def build_fallback_scenes_js(
                 f'pill("{lid}", {json.dumps(row_html)}, {card_x}, {lower_y + 20}, {{w: {card_w}}});',
                 f'lin("{lid}", {s:.2f}, 0.32);',
             ])
-            if e - s > 2.2:
-                js_lines.append(f'tl.to("#{lid}", {{y: -6, duration: 0.7, ease: "sine.inOut"}}, {round((s + e) / 2.0, 2):.2f});')
+            _append_periodic_nudges(f"#{lid}", s, e)
             js_lines.append(f'out("#{lid}", {max(s + 0.5, e - 0.28):.2f});')
         else:
             col_var = "T" if idx % 2 == 0 else "L"
@@ -931,9 +1061,7 @@ def build_fallback_scenes_js(
                 f'strokes("{bid}", {s:.2f}, 0.45);',
                 f'lin("{lid}", {s + 0.08:.2f}, 0.38);',
             ])
-            if e - s > 2.2:
-                mid_t = round((s + e) / 2.0, 2)
-                js_lines.append(f'pulse("#{lid}", "{cx}px {y_title + 52}px", {mid_t:.2f}, 1.06);')
+            _append_periodic_nudges(f"#{lid}", s, e, pulse_origin=f"{cx}px {y_title + 52}px")
             js_lines.append(f'out("#{bid},#{lid}", {max(s + 0.5, e - 0.28):.2f});')
         last_end = e
 

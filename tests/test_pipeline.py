@@ -1486,5 +1486,174 @@ class TestPromotedStyleBlueprints:
                 assert not has_issues, f"{preset_id} unexpected check issues: {issues}"
 
 
+# ============================================================================
+# 6. REGRESSION & SITUATIONAL CRAFT FIX TESTS
+# ============================================================================
 
+class TestRegressionAndCraftFixes:
+    def test_classify_stderr_line_and_proc_streams(self):
+        assert adapters._classify_stderr_line("Installed 23 packages in 19ms") == "[INFO] Installed 23 packages in 19ms"
+        assert adapters._classify_stderr_line("   [non-blocking] Failed to load resource: 404").startswith("[WARN]")
+        assert adapters._classify_stderr_line("WARNING: deprecated flag").startswith("[WARN]")
+        assert adapters._classify_stderr_line("hyperframes check: 2 passed, 0 failed").startswith("[INFO]")
+        assert adapters._classify_stderr_line("RuntimeError: bad clip").startswith("[ERR]")
+        assert adapters._classify_stderr_line("SyntaxError: invalid token").startswith("[ERR]")
 
+        lines: list[str] = []
+
+        async def _run():
+            return await adapters._run_proc(
+                [sys.executable, "-c", "import sys; print('hello-out'); print('Installed 5 pkgs', file=sys.stderr)"],
+                log_cb=lines.append,
+            )
+
+        code, out, err = asyncio.run(_run())
+        assert code == 0
+        assert "[OUT] hello-out" in lines
+        assert "[INFO] Installed 5 pkgs" in lines
+        assert not any(l.startswith("[ERR]") for l in lines)
+
+    def test_validate_and_fix_edl_contiguous_merge_and_establishing(self):
+        words = {
+            "c01": [
+                ["First", 2.0, 2.3],
+                ["sentence", 2.35, 2.7],
+                ["Second", 2.85, 3.1],
+                ["sentence", 3.15, 3.5],
+                ["uh", 5.1, 5.25],
+                ["Third", 5.35, 5.7],
+                ["part", 5.75, 6.1],
+            ]
+        }
+        edl = {
+            "title": "Test Title",
+            "parts": [
+                {"id": "p00", "clip": "c02", "range": [0.0, 4.0], "say": "", "shot_type": "establishing", "j_cut_s": 0.9},
+                {"id": "p01", "clip": "c01", "range": [2.0, 2.75], "say": "First sentence", "beat": "hook", "j_cut_s": 0.25},
+                {"id": "p02", "clip": "c01", "range": [2.85, 3.55], "say": "Second sentence", "beat": "setup"},
+                {"id": "p03", "clip": "c01", "range": [5.35, 6.15], "say": "Third part", "beat": "setup"},
+            ],
+        }
+        fixed = validate_and_fix_edl_overlaps(edl, words)
+        parts = fixed["parts"]
+        # Establishing shot keeps clamped 2.5s max range without word snapping, j_cut_s clamped to 0.6
+        assert parts[0]["shot_type"] == "establishing"
+        assert parts[0]["range"] == [0.0, 2.5]
+        assert parts[0]["j_cut_s"] == 0.6
+        # p01 + p02 merge cleanly because gap is 0.10s <= 0.35s and no skipped word lies between 2.75 and 2.85
+        assert len(parts) == 3
+        assert parts[1]["say"] == "First sentence Second sentence"
+        assert parts[1]["range"] == [2.0, 3.55]
+        # p03 stays separate because skipped word "uh" sits between 3.55 and 5.35
+        assert parts[2]["say"] == "Third part"
+
+    def test_normalize_ass_color_and_craft_config_persistence(self):
+        assert adapters._normalize_ass_color("pink") == "&HA04FFF&"
+        assert adapters._normalize_ass_color("blue") == "&HFF6B3D&"
+        assert adapters._normalize_ass_color("#D8FF2B") == "&H2BFFD8&"
+        assert adapters._normalize_ass_color("emerald", palette={"emerald": "#10B981"}) == "&H81B910&"
+
+        with tempfile.TemporaryDirectory() as td:
+            jm = JobManager(jobs_root=Path(td))
+            job_default = jm.create_job(clip_paths=["/tmp/a.mp4"])
+            assert job_default["config"]["jl_cuts"] == "auto"
+            assert job_default["config"]["room_tone"] == "auto"
+            assert job_default["config"]["establishing_shot"] == "auto"
+
+            job_custom = jm.create_job(
+                config={"jl_cuts": "on", "room_tone": "off", "establishing_shot": "on"},
+                clip_paths=["/tmp/a.mp4"],
+            )
+            assert job_custom["config"]["jl_cuts"] == "on"
+            assert job_custom["config"]["room_tone"] == "off"
+            assert job_custom["config"]["establishing_shot"] == "on"
+
+            from agent_prompts import build_edl_prompt
+            prompt = build_edl_prompt(
+                {"script_text": "Hello world"},
+                "0.0-1.0 Hello world",
+                "Hello world",
+                job_options=job_custom["config"],
+            )
+            assert "jl_cuts=on" in prompt
+            assert "establishing_shot=on" in prompt
+
+    def test_find_foreground_sticker_bbox_excludes_dark_scrim(self):
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGBA", (1080, 1920), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Full-band translucent dark .scrim (opacity ~0.6, dark navy RGB)
+        draw.rectangle([0, 1140, 1080, 1500], fill=(10, 12, 18, 155))
+        # Centered bright foreground card inside band
+        draw.rectangle([160, 1200, 920, 1430], fill=(248, 250, 252, 255))
+
+        bbox = adapters._find_foreground_sticker_bbox(img, 1140, 1500)
+        assert bbox == (160, 1200, 921, 1431) or bbox == (160, 1200, 920, 1430)
+        assert bbox[0] >= 150 and bbox[2] <= 930
+
+    @pytest.mark.skipif(not adapters.HYPERFRAMES_BIN, reason="hyperframes CLI not installed")
+    def test_long_multi_beat_fallback_no_404_or_google_fonts(self):
+        from agent_prompts import build_fallback_scenes_js, render_hyperframes_index_html
+
+        parts = []
+        edl_parts = []
+        t = 0.0
+        for i in range(14):
+            dur = 7.5 if i == 5 else 2.4
+            parts.append({"id": f"p{i+1:02d}", "beat": "setup", "start": t, "end": t + dur, "say": f"Point number {i+1}"})
+            edl_parts.append({"id": f"p{i+1:02d}", "note": f"Key beat {i+1}"})
+            t += dur
+        tl = {"total": round(t, 2), "parts": parts}
+        edl = {"title": "Fourteen Beats Test", "parts": edl_parts}
+
+        preset = get_preset("monochrome_thesis_card")
+        cues_data, scenes_js = build_fallback_scenes_js(tl, edl, preset)
+        assert len(cues_data["beats"]) > 10
+
+        html = render_hyperframes_index_html(preset, scenes_js, tl["total"])
+        assert '<link rel="icon" href="data:,"/>' in html
+        assert "font-family:-apple-system" not in html
+
+        v6_hf_assets = adapters.V6_REF_DIR / "hf" / "assets"
+        with tempfile.TemporaryDirectory() as td:
+            hf_dir = Path(td) / "hf"
+            assets_dir = hf_dir / "assets"
+            fonts_dir = assets_dir / "fonts"
+            fonts_dir.mkdir(parents=True, exist_ok=True)
+            if (v6_hf_assets / "gsap.min.js").exists():
+                shutil.copy2(v6_hf_assets / "gsap.min.js", assets_dir / "gsap.min.js")
+            if (v6_hf_assets / "fonts").exists():
+                for f in (v6_hf_assets / "fonts").glob("*.woff2"):
+                    shutil.copy2(f, fonts_dir / f.name)
+
+            (hf_dir / "hyperframes.json").write_text(
+                json.dumps(
+                    {
+                        "$schema": "https://hyperframes.heygen.com/schema/hyperframes.json",
+                        "width": preset["width"],
+                        "height": preset["height"],
+                        "fps": preset["fps"],
+                        "duration": tl["total"],
+                    }
+                )
+            )
+            (hf_dir / "cues.json").write_text(json.dumps(cues_data, indent=2))
+            (hf_dir / "cues.js").write_text(f"window.CUES={json.dumps(cues_data)};\n")
+            (hf_dir / "index.html").write_text(html)
+
+            res = subprocess.run(
+                [adapters.HYPERFRAMES_BIN, "check", str(hf_dir), "--json"],
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            assert res.returncode == 0, f"check failed: {res.stdout}\n{res.stderr}"
+            combined_out = res.stdout + "\n" + res.stderr
+            assert "404" not in combined_out
+            assert "fonts.googleapis.com" not in combined_out
+            check_data = json.loads(res.stdout)
+            assert check_data.get("ok") is True, check_data
+            assert check_data.get("lint", {}).get("errorCount", 0) == 0, check_data
+            assert check_data.get("layout", {}).get("warningCount", 0) == 0, check_data
+            assert check_data.get("runtime", {}).get("warningCount", 0) == 0, check_data

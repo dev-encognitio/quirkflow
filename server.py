@@ -113,6 +113,10 @@ def enrich_job(job: dict) -> dict:
     }
     if not cfg.get("vision_model_explicit"):
         cfg_models["vision_model"] = cfg_models["mechanical_model"]
+    def _norm_mode(val: Any) -> str:
+        s = str(val or "auto").strip().lower()
+        return s if s in ("auto", "on", "off") else "auto"
+
     job["config"] = {
         "preset_id": cfg.get("preset_id") or job.get("preset_id", "story_vertical"),
         "story_prompt": cfg.get("story_prompt") if "story_prompt" in cfg else job.get("story_prompt", ""),
@@ -120,6 +124,9 @@ def enrich_job(job: dict) -> dict:
         "gate_b": cfg.get("gate_b", job.get("pause_at_audio", False)),
         "whisper_model": cfg.get("whisper_model") or job.get("whisper_model", "small.en"),
         "ai_broll": cfg.get("ai_broll") or job.get("broll_provider", "off"),
+        "jl_cuts": _norm_mode(cfg.get("jl_cuts")),
+        "room_tone": _norm_mode(cfg.get("room_tone")),
+        "establishing_shot": _norm_mode(cfg.get("establishing_shot")),
         "models": cfg_models,
         "vision_model_explicit": bool(cfg.get("vision_model_explicit")),
     }

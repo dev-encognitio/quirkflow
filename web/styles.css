@@ -1016,8 +1016,13 @@ body.studio-dark {
   border-top: 1px solid var(--border-subtle);
 }
 
+.options-row-craft {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 @media (max-width: 580px) {
-  .options-row {
+  .options-row,
+  .options-row-craft {
     grid-template-columns: 1fr;
   }
 }
